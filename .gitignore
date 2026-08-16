@@ -1,0 +1,215 @@
+# ==================================================
+# 通用 .gitignore —— 通用忽略规则
+# ==================================================
+
+# ---- 操作系统 ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+Thumbs.db:encryptable
+*.lnk
+
+# ---- 编辑器 / IDE ----
+# VS Code
+.vscode/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/tasks.json
+.idea/
+*.ipr
+*.iws
+*.iml
+*.swp
+*.swo
+*~
+.idea/workspace.xml
+kate-swp
+.swp
+.project
+.classpath
+.settings/
+.fleet/
+.vscode-test/
+*.code-workspace
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# JetBrains / IntelliJ / PyCharm / WebStorm
+.idea/
+out/
+*.ipr
+*.iws
+*.iml
+
+# ---- 日志 / 临时文件 ----
+*.log
+*.tmp
+*.temp
+*.cache
+*.bak
+*.old
+*~
+*.swp
+logs/
+log/
+
+# ---- Node.js ----
+node_modules/
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.lerna/
+.eslintcache
+.stylelintcache
+*.tsbuildinfo
+.mtscache
+.ctercache
+.yarn/cache
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+coverage/
+dist/
+dist-web/
+lib/
+build/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dmypy.json
+.pyre/
+.pytype/
+.ipynb_checkpoints/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+ENV/
+.env
+.venv
+virtualenv/
+
+# ---- Java / JVM ----
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+hs_err_pid*
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+.releaseBackup
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+vendor/
+
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# PHP
+vendor/
+composer.phar
+.phpunit.result.cache
+
+# Ruby
+*.gem
+.bundle/
+vendor/bundle/
+
+# C / C++
+*.o
+*.obj
+*.exe
+*.a
+*.so
+*.dll
+*.dylib
+build/
+cmake-build-*/
+
+# ---- 测试产物 ----
+test-results/
+junit.xml
+cucumber.xml
+*.test-results
+
+# ---- 密钥 / 敏感信息 ----
+# 注意：永远不要提交真实密钥！
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+config/secrets/
+*.p12
+*.pfx
+
+# ---- 压缩包 / 二进制大文件 ----
+*.zip
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.iso
+*.dmg
+*.pkg
+*.deb
+*.rpm
+*.msi
+*.exe
+*.bin
+
+# ---- DSH / 工具特定 ----
+*.dsh
+.dsh/
