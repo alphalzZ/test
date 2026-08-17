@@ -4,14 +4,18 @@ LWM LLR 预测项目 —— 全局配置
 """
 import os
 
-# ================= 系统参数（3GPP 兼容 OFDM） =================
-N_ANT = 8                # 基站天线数
-N_SC = 128               # 训练块大小（子载波数，= BLOCK_SIZE）
-SCS_KHZ = 30             # 子载波间隔 30kHz（NR mu=1）
-FFT_SIZE = 4096          # FFT 大小（覆盖最大 3276 子载波）
-PILOT_SPACING = 4        # DM-RS comb-4
+# ================= 系统参数（3GPP 兼容 OFDM，Sionna PUSCH） =================
+N_ANT = 8                # 基站（gNB）接收天线数 num_rx
+N_SC = 120               # 子载波数（10 RB × 12）—— Sionna PUSCH 网格
+N_SYMB = 14              # OFDM 符号数（1 slot）
+N_DATA_RE = 1440         # 数据 RE 数（12 数据符号 × 120 子载波，DMRS 符号 2/11 全导频）
+SCS_KHZ = 15             # 子载波间隔 15kHz（NR mu=0，Sionna 默认）
+FFT_SIZE = 120           # FFT 大小
+PILOT_SPACING = 4        # （保留，Sionna 用 DMRS type1 替代）
 MAX_LLR = 20.0           # LLR 裁剪上限
-CHANNEL_MODEL = "TDL-C"  # 3GPP TR 38.900 TDL-C
+CHANNEL_MODEL = "TDL-A"  # 3GPP TR 38.901 TDL-A（Sionna 信道建模）
+CARRIER_FREQUENCY = 3.5e9
+DELAY_SPREAD = 30e-9
 
 # ================= 调制 =================
 MOD_ORDERS = [4, 16, 64, 256]   # QPSK / 16QAM / 64QAM / 256QAM
@@ -35,27 +39,27 @@ CKPT_LLR_NO_PT = os.path.join(WEIGHTS_DIR, "lwm_llr_no_pretrain.pt")  # 对照: 
 
 # ================= 训练超参数 =================
 # 阶段 1: MCM 继续预训练
-PT_N_SAMPLES = 3000        # 预训练样本数（每样本 128 子载波 = 1 块）
-PT_EPOCHS = 15
-PT_BATCH = 64
+PT_N_SAMPLES = 1000        # 预训练样本数（每样本 14 符号 = 14 个 MCM 序列）
+PT_EPOCHS = 12
+PT_BATCH = 32
 PT_LR = 1e-5
 PT_MASK_RATIO = 0.15
 PT_SEED = 0
 
 # 阶段 2: LLR 微调
-FT_TRAIN_N = 4000
-FT_VAL_N = 500
-FT_EPOCHS = 25
-FT_BATCH = 64
+FT_TRAIN_N = 1200
+FT_VAL_N = 200
+FT_EPOCHS = 12
+FT_BATCH = 32
 FT_LR = 1e-4              # decoder 学习率
 FT_LR_BACKBONE = 1e-6     # LWM 骨干学习率（微调）
 FT_FREEZE_BACKBONE = False
 FT_SEED = 1
 
 # 评估
-EVAL_N = 400              # 评估样本数
+EVAL_N = 180              # 评估样本数（6 SNR × 30）
 EVAL_SEED = 42
-EVAL_NSC_LIST = [32, 128, 512, 2048]   # 可变子载波数测试（含大带宽分块）
+EVAL_NSC_LIST = [120]   # 固定 120 子载波（Sionna PUSCH 10 RB）
 EVAL_SNR_LIST = [-5, 0, 5, 10, 15, 20]
 
 for d in (DATA_DIR, WEIGHTS_DIR):

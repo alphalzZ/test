@@ -18,7 +18,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from data_gen import generate_dataset
+from data_gen_sionna import generate_dataset
 from dataset import LLRDataset, llr_collate, pack_samples
 from model import LWMLLR, load_official_backbone
 
@@ -26,8 +26,10 @@ from model import LWMLLR, load_official_backbone
 def build_ft_data(n_train, n_val, seed):
     print(f"[FT] 生成微调数据: train={n_train}, val={n_val} (seed={seed}) ...")
     t0 = time.time()
-    tr = generate_dataset(n_train, n_sc=config.N_SC, seed=seed)
-    va = generate_dataset(n_val, n_sc=config.N_SC, seed=seed + 1000)
+    tr = generate_dataset(n_train, num_rx_ant=config.N_ANT,
+                          n_size_grid=config.N_SC // 12, seed=seed)
+    va = generate_dataset(n_val, num_rx_ant=config.N_ANT,
+                          n_size_grid=config.N_SC // 12, seed=seed + 1000)
     tr_p = pack_samples(tr)
     va_p = pack_samples(va)
     print(f"[FT] 数据就绪 ({time.time()-t0:.1f}s)")

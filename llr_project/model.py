@@ -197,14 +197,20 @@ class LLRDecoder(nn.Module):
 
 # ================= 组合模型 =================
 
-# 128 子载波块内的数据子载波索引（comb-4 导频 -> 96 个数据子载波）
-from data_gen import data_subcarrier_idx, qam_constellation, demap_llr
-DATA_IDX_128 = data_subcarrier_idx(config.N_SC, config.PILOT_SPACING)
-N_DATA_128 = len(DATA_IDX_128)
+from data_gen import qam_constellation, demap_llr
+from tokenizer import data_re_index
+
+# Sionna PUSCH 数据 RE 索引与维度
+DATA_RE_IDX = data_re_index()          # (1440, 2) [sc, symb]
+N_DATA = len(DATA_RE_IDX)
+N_SC_3D = 120
+N_SYMB_3D = 14
+DATA_SC = DATA_RE_IDX[:, 0]
+DATA_SYMB = DATA_RE_IDX[:, 1]
 
 
 class LWMLLR(nn.Module):
-    """LWM 骨干 + LLR decoder。输入信道矩阵 H -> 数据子载波的逐比特 LLR。"""
+    """LWM 骨干 + LLR decoder。输入 3D 信道 H (B,8,120,14) -> 数据 RE 的逐比特 LLR。"""
 
     def __init__(self, backbone=None, freeze_backbone=False, device="cpu"):
         super().__init__()
@@ -215,81 +221,66 @@ class LWMLLR(nn.Module):
                 p.requires_grad = False
 
     @staticmethod
-    def _tokenize(H):
+    def _tokenize_3d(H):
         """
-        H: (B, 8, 128) complex -> input_ids (B, 129, 16) float
-        patch_k = [Re(H[:,k]); Im(H[:,k])]，加 CLS token。
+        H: (B, 8, 120, 14) complex -> input_ids (B*14, 129, 16) float
+        逐 OFDM 符号 tokenize：每符号 (8,120) -> 120 patches (+8 pad) + CLS = 129。
         """
-        B, _, T = H.shape
-        real = H.real.transpose(1, 2)      # (B, T, 8)
-        imag = H.imag.transpose(1, 2)
-        patches = torch.cat([real, imag], dim=-1)          # (B, T, 16)
-        cls = 0.2 * torch.ones(B, 1, 16, dtype=patches.dtype, device=H.device)
-        return torch.cat([cls, patches], dim=1)            # (B, 129, 16)
+        B, _, _, S = H.shape
+        real = H.real.permute(0, 3, 2, 1)   # (B, S, 120, 8)
+        imag = H.imag.permute(0, 3, 2, 1)
+        patches = torch.cat([real, imag], dim=-1)          # (B, S, 120, 16)
+        pad = torch.zeros(B, S, 8, 16, dtype=patches.dtype, device=H.device)
+        patches = torch.cat([patches, pad], dim=2)         # (B, S, 128, 16)
+        cls = 0.2 * torch.ones(B, S, 1, 16, dtype=patches.dtype, device=H.device)
+        seq = torch.cat([cls, patches], dim=2)             # (B, S, 129, 16)
+        return seq.reshape(B * S, 129, 16)
 
     def forward(self, H, z, sigma2, mod_oh, llr_base):
         """
-        H: (B, 8, 128) complex（128 子载波块，含导频）
-        z: (B, 96) complex（数据子载波均衡符号）
+        H: (B, 8, 120, 14) complex（Sionna PUSCH 3D 信道，含 DMRS 符号）
+        z: (B, 1440) complex（数据 RE 均衡符号）
         sigma2: (B,)
         mod_oh: (B, 4)
-        llr_base: (B, 96, 8) 传统均衡后软解调基线 LLR
-        -> llr (B, 96, 8)（基线 + 修正量，数据子载波逐比特 LLR）
+        llr_base: (B, 1440, 8) 传统均衡后软解调基线 LLR
+        -> llr (B, 1440, 8)（基线 + 修正量）
         """
-        input_ids = self._tokenize(H)                 # (B, 129, 16)
-        output = self.backbone.encode(input_ids)      # (B, 129, 64)
-        h_emb = output[:, 1:, :]                      # (B, 128, 64) 逐子载波
-        h_data = h_emb[:, DATA_IDX_128, :]            # (B, 96, 64) 仅数据子载波
-        patch_all = input_ids[:, 1:, :]               # (B, 128, 16) H_est patch
-        patch_data = patch_all[:, DATA_IDX_128, :]    # (B, 96, 16)
+        B = H.shape[0]
+        input_ids = self._tokenize_3d(H)               # (B*14, 129, 16)
+        output = self.backbone.encode(input_ids)       # (B*14, 129, 64)
+        h_emb = output[:, 1:1 + N_SC_3D, :]            # (B*14, 120, 64) 逐子载波
+        h_emb = h_emb.reshape(B, N_SYMB_3D, N_SC_3D, -1)  # (B, 14, 120, 64)
+        h_data = h_emb[:, DATA_SYMB, DATA_SC, :]       # (B, 1440, 64)
+        patch_all = input_ids[:, 1:1 + N_SC_3D, :].reshape(B, N_SYMB_3D, N_SC_3D, -1)
+        patch_data = patch_all[:, DATA_SYMB, DATA_SC, :]   # (B, 1440, 16)
         return self.decoder(h_data, patch_data, z, sigma2, mod_oh, llr_base)
 
-    def infer_llr(self, H, z, sigma2, mod_order, sigma2_eq=None):
+    def infer_llr(self, H, z, sigma2, mod_order, sigma2_eq):
         """
-        推理入口：支持任意 N_sc（自动分块，每块 128 子载波，输出按数据位置拼回）。
-        H: (N_ant, N_sc) complex
-        z: (n_data_total,) complex（全部数据子载波的均衡符号）
+        推理入口（Sionna 3D 信道）。
+        H: (8, 120, 14) complex
+        z: (1440,) complex（数据 RE 均衡符号）
         sigma2: float
         mod_order: int
-        sigma2_eq: (n_data_total,) 均衡后等效噪声方差（计算基线 LLR 用）
-        -> llr (n_data_total, log2M) float32
+        sigma2_eq: (1440,)
+        -> llr (1440, log2M) float32
         """
         self.eval()
-        block = config.N_SC
-        n_sc = H.shape[1]
-        data_idx = data_subcarrier_idx(n_sc, config.PILOT_SPACING)
+        H = np.asarray(H)
+        assert H.shape == (config.N_ANT, N_SC_3D, N_SYMB_3D), H.shape
         mod_oh = np.zeros((1, config.MOD_ONHOT_DIM), dtype=np.float32)
         mod_oh[0, config.MOD_ORDERS.index(mod_order)] = 1.0
         X, btab = qam_constellation(mod_order)
-        llr_blocks = []
-        z_idx = 0
+        llr_base = np.zeros((1, N_DATA, config.MAX_BITS), dtype=np.float32)
+        llr_base[0, :, :btab.shape[1]] = demap_llr(z, sigma2_eq, X, btab, config.MAX_LLR)
         with torch.no_grad():
-            for start in range(0, n_sc, block):
-                end = min(start + block, n_sc)
-                H_b = H[:, start:end]
-                blk_data_rel = data_idx[(data_idx >= start) & (data_idx < end)] - start
-                n_d = len(blk_data_rel)
-                z_b = z[z_idx:z_idx + n_d]
-                s2eq_b = sigma2_eq[z_idx:z_idx + n_d] if sigma2_eq is not None else None
-                z_idx += n_d
-                if end - start < block:
-                    pad = np.zeros((config.N_ANT, block - (end - start)), dtype=np.complex64)
-                    H_b = np.concatenate([H_b, pad], axis=1)
-                # 基线 LLR（均衡后 demap），补零位置填充 0
-                llr_base = np.zeros((1, N_DATA_128, config.MAX_BITS), dtype=np.float32)
-                if s2eq_b is not None:
-                    llr_base[0, :n_d, :btab.shape[1]] = demap_llr(
-                        z_b, s2eq_b, X, btab, config.MAX_LLR)
-                H_t = torch.tensor(H_b[None], dtype=torch.complex64)
-                z_t = torch.zeros((1, N_DATA_128), dtype=torch.complex64)
-                z_t[0, :n_d] = torch.tensor(z_b, dtype=torch.complex64)
-                s2_t = torch.tensor([sigma2], dtype=torch.float32)
-                mo_t = torch.tensor(mod_oh, dtype=torch.float32)
-                lb_t = torch.tensor(llr_base, dtype=torch.float32)
-                llr_b = self(H_t, z_t, s2_t, mo_t, lb_t)[0, :n_d].cpu().numpy()
-                llr_blocks.append(llr_b)
-        llr = np.concatenate(llr_blocks, axis=0)
-        return llr.astype(np.float32)
+            H_t = torch.tensor(H[None], dtype=torch.complex64)
+            z_t = torch.tensor(z[None], dtype=torch.complex64)
+            s2_t = torch.tensor([sigma2], dtype=torch.float32)
+            mo_t = torch.tensor(mod_oh, dtype=torch.float32)
+            lb_t = torch.tensor(llr_base, dtype=torch.float32)
+            llr = self(H_t, z_t, s2_t, mo_t, lb_t)[0].cpu().numpy()
+        return llr[:, :btab.shape[1]].astype(np.float32)
 
 
 def load_official_backbone(device="cpu"):
@@ -301,15 +292,16 @@ def load_official_backbone(device="cpu"):
 
 
 if __name__ == "__main__":
-    # 冒烟测试：官方权重加载 + 前向
+    # 冒烟测试：官方权重加载 + 3D 前向
     bb = load_official_backbone()
     model = LWMLLR(bb).eval()
-    H = torch.randn(2, 8, 128, dtype=torch.complex64)
-    z = torch.randn(2, 128, dtype=torch.complex64)
+    H = torch.randn(2, 8, 120, 14, dtype=torch.complex64)
+    z = torch.randn(2, N_DATA, dtype=torch.complex64)
     s2 = torch.tensor([0.1, 0.2])
     mo = torch.zeros(2, 4)
     mo[:, 1] = 1.0
-    out = model(H, z, s2, mo)
+    lb = torch.zeros(2, N_DATA, 8)
+    out = model(H, z, s2, mo, lb)
     print("LWMLLR output:", tuple(out.shape), out.dtype)
     n_params = sum(p.numel() for p in model.parameters())
     print("total params:", n_params)

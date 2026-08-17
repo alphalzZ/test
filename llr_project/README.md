@@ -32,9 +32,9 @@
 
 **核心特性**：
 
-- ✅ 3GPP 兼容 OFDM 链路仿真（TDL-C 信道、QAM、DM-RS、MMSE 均衡）
+- ✅ 标准 Sionna PUSCH 链路仿真（DMRS type1 {1+1}、TDL-A 信道、LS-DFT 信道估计）
 - ✅ LWM 官方权重直接复用（0.6M 参数，CPU 可训练）
-- ✅ 子载波对齐 tokenizer，支持 **8 天线 × 4~3276 可变子载波**（自动分块）
+- ✅ 子载波对齐 tokenizer，模型输入维度 **{num_rx, num_sc, num_symb}** = (8, 120, 14)
 - ✅ **残差学习** Decoder：保证性能不劣于传统基线，专注"增强"
 - ✅ 完整的训练（MCM 继续预训练 + 监督微调）与评估（BER / LLR MSE）流水线
 - ✅ 全部 CPU 可运行，无 GPU 依赖
@@ -89,8 +89,9 @@
 python3 -m venv .venv
 source .venv/bin/activate
 
-# 2. 安装依赖
+# 2. 安装依赖（Sionna 2.0.1 为纯 PyTorch 实现，无需 TensorFlow）
 pip install torch numpy pandas matplotlib scikit-learn tqdm
+pip install sionna
 ```
 
 ### 3.3 获取 LWM 官方权重
@@ -127,43 +128,51 @@ chmod +x run_all.sh
 
 ### 5.1 数据来源
 
-数据由 `data_gen.py` **在线生成**（3GPP 兼容 OFDM 链路仿真），无需外部数据集。每次运行使用固定随机种子，可复现。
+数据由 **`data_gen_sionna.py`** 基于 [Sionna 2.x](https://nvlabs.github.io/sionna/phy/index.html)（PyTorch 后端）在线生成，实现**标准的 5G NR PUSCH 链路**（对齐 Sionna `sionna.phy.nr` 模块）：
 
-### 5.2 系统参数（对齐 3GPP NR / TR 38.901）
+1. **PUSCH 发射机**（`PUSCHTransmitter`）：QAM 调制 → 层映射 → 资源网格（数据 + DMRS）
+2. **DMRS 配置**（`PUSCHDMRSConfig`）：**type1**，**{1+1} 双 DMRS 符号**（前置符号 2 + 附加符号 11），`num_cdm_groups_without_data=2`
+3. **信道建模**（`sionna.phy.channel.tr38901.TDL` + `TimeChannel`）：3GPP TDL-A，8 根接收天线
+4. **OFDM 调制/解调**（`OFDMModulator`/`OFDMDemodulator`）：含 CP，过信道加噪
+5. **信道估计**（`PUSCHLSChannelEstimator`）：DMRS 处 LS 估计 + **线性插值** → 输出**完整频域信道估计**
+6. **MMSE 均衡** + **max-log LLR**（数据 RE，用理想信道作监督标签）
+
+> 安装：`pip install sionna`（Sionna 2.0.1 已改为纯 PyTorch 实现，**无需 TensorFlow**，支持 Python 3.11+）。
+
+### 5.2 系统参数（标准 3GPP NR PUSCH）
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| 基站天线 | 8 | 如 8T8R |
-| UE 天线 | 1 | 单流 |
-| 子载波间隔 | 30 kHz | NR `mu=1` |
-| 训练子载波/块 | 128 | = LWM 序列长度 128 patch |
-| 支持子载波范围 | 4 ~ 3276 | 评估时自动分块（100MHz/273PRB 全覆盖） |
-| 信道模型 | TDL-C | 6 抽头，3GPP TR 38.900 |
-| 调制方式 | QPSK/16QAM/64QAM/256QAM | Gray 映射，能量归一化 E[|x|²]=1 |
-| 导频 | DM-RS comb-4 | 导频子载波发送已知符号 1 |
-| 信道估计 | LS-DFT 去噪插值 | 含估计误差（真实接收机场景） |
-| 均衡 | MMSE（8→1） | 逐子载波 |
+| 接收天线（gNB） | 8 | `num_rx` |
+| 发射天线（UE） | 1 | `num_tx_ant` |
+| 子载波 | 120 | 10 RB × 12 |
+| OFDM 符号/slot | 14 | `num_symb` |
+| 子载波间隔 | 15 kHz | NR `mu=0` |
+| 信道模型 | TDL-A | 3GPP TR 38.901，delay_spread=30ns，3.5GHz |
+| DMRS | type1, {1+1} | 符号 2 + 符号 11，2 CDM 组 |
+| 调制方式 | QPSK/16QAM/64QAM/256QAM | Gray 映射，能量归一化 |
+| 均衡 | MMSE（8→1） | 逐数据 RE |
 | SNR 范围 | -5 ~ 25 dB | 训练时均匀采样 |
+| **模型输入信道** | **(8, 120, 14)** | `{num_rx, num_sc, num_symb}` 完整频域信道估计 |
 
 ### 5.3 数据格式
 
-样本为 dict（npz/torch 张量），字段：
+样本为 dict（data_gen_sionna 输出）：
 
 | 字段 | 形状 | 类型 | 说明 |
 |------|------|------|------|
-| `H_est` | (8, N_sc) | complex64 | 信道估计（模型输入） |
-| `H_true` | (8, N_sc) | complex64 | 真实信道（评估用） |
-| `y` | (8, N_sc) | complex64 | 频域接收信号 |
-| `z` | (n_data,) | complex64 | 数据子载波均衡软符号（模型输入） |
+| `H_est` | **(8, 120, 14)** | complex64 | **完整频域信道估计**（LS+插值，模型输入） |
+| `H_true` | (8, 120, 14) | complex64 | 真实信道（评估用） |
+| `z` | (1440,) | complex64 | 数据 RE 均衡软符号（模型输入） |
 | `sigma2` | scalar | float32 | 噪声方差（模型输入） |
-| `sigma2_eq` | (n_data,) | float32 | 均衡后等效噪声方差 |
-| `llr_ref` | (n_data, log2M) | float32 | 参考 LLR（监督标签，理想信道 max-log） |
-| `bits_tx` | (n_data, log2M) | int8 | 发送比特（评估用） |
+| `sigma2_eq` | (1440,) | float32 | 均衡后等效噪声方差 |
+| `llr_ref` | (1440, log2M) | float32 | 参考 LLR（监督标签，理想信道 max-log） |
+| `bits_tx` | (1440, log2M) | int8 | 发送比特（评估用） |
 | `mod_order` | scalar | int32 | 调制阶数 |
-| `n_sc` / `n_data` | scalar | int32 | 子载波数 / 数据子载波数 |
-| `data_idx` | (n_data,) | int32 | 数据子载波索引 |
+| `n_sc`/`n_symb`/`n_data` | scalar | int32 | 子载波/符号/数据 RE 数 |
+| `data_re_idx` | (1440, 2) | int32 | 数据 RE 索引 [sc, symb] |
 
-> 说明：comb-4 导频下，每 4 个子载波有 1 个导频（不发送数据比特），因此 LLR/比特只存在于 **数据子载波**（N_sc=128 时 n_data=96）。
+> 说明：DMRS 符号 2、11 全子载波为导频（2 CDM 组），**数据 RE 数 = 12 符号 × 120 子载波 = 1440**。LLR/比特只存在于数据 RE。模型输入 `H_est` 为完整 14 符号 × 120 子载波 × 8 天线的信道估计（用户要求的 `{num_rx, num_sc, num_symb}` 维度）。
 
 ### 5.4 数据集规模（config.py 可调）
 
@@ -181,8 +190,9 @@ chmod +x run_all.sh
 ```
 llr_project/
 ├── config.py            # 全局配置：系统参数、路径、训练超参数
-├── data_gen.py          # 数据生成器（信道/调制/估计/均衡/LLR）
-├── tokenizer.py         # 子载波对齐 patch tokenizer（含 MCM mask 构造）
+├── data_gen_sionna.py   # Sionna PUSCH 数据生成器（标准 5G NR 链路）
+├── data_gen.py          # 工具函数（QAM 星座 / max-log LLR / demapper）
+├── tokenizer.py         # 子载波对齐 patch tokenizer（含 3D 逐符号 tokenize）
 ├── dataset.py           # PyTorch Dataset（含 llr_base 残差锚点预计算）
 ├── model.py             # LWM 骨干（官方结构）+ 残差 LLR Decoder + 组合模型
 ├── train_pretrain.py    # 阶段 1：MCM 继续预训练
@@ -315,9 +325,9 @@ patch_k = [Re(H[:,k]); Im(H[:,k])] ∈ R^16
 - 序列长度 = 子载波数（128 分块，+CLS 后 129 = 原生 MAX_LEN）
 - 每 patch 对应一个子载波 → 与逐子载波 LLR 输出天然对齐
 
-### 9.2 可变子载波支持（4~3276）
+### 9.2 3D 信道输入（{num_rx, num_sc, num_symb}）
 
-推理时按 128 子载波自动分块，块间无重叠（LLR 逐子载波独立），尾块补零，输出按数据位置拼回。覆盖 5G NR 100MHz（273 PRB = 3276 子载波）。
+Sionna PUSCH 链路输出完整频域信道估计 `H_est (8, 120, 14)`（rx × sc × symb）。模型**逐 OFDM 符号独立编码**：每个符号的 (8, 120) 信道 → 120 patches（pad 到 128）+ CLS → LWM 序列 (129, 16)，14 个符号得到 14 组 channel embedding。Decoder 只对**数据 RE**（1440 个，DMRS 符号 2/11 之外）输出 LLR。
 
 ### 9.3 残差学习 Decoder（关键设计）
 
@@ -355,8 +365,8 @@ curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 .venv/bin/python /tmp/get-pip.py
 ```
 
-**Q4：为什么 LLR 只对 96 个子载波（而非 128）输出？**
-comb-4 导频下每 4 个子载波有 1 个导频（128/4=32 个导频），导频位置不发送数据比特，无 LLR。数据子载波 = 128 - 32 = 96。
+**Q4：为什么 LLR 只对 1440 个 RE（而非全部 1680 个 RE）输出？**
+DMRS type1 + 2 CDM 组 + {1+1} 双符号配置下，符号 2 和 11 的全部 120 个子载波都是导频（不发送数据比特），无 LLR。数据 RE = 12 符号 × 120 子载波 = 1440。
 
 **Q5：如何用我自己的数据？**
 `data_gen.generate_sample()` 返回样本 dict（见 5.3 表）。用自己的数据时，只需保证字段一致：`H_est(8,N_sc)`、`z(n_data,)`、`sigma2`、`llr_ref(n_data,log2M)`、`bits_tx`、`mod_order`、`sigma2_eq`。可以改写 `generate_dataset()` 为读取自己的数据集。
@@ -386,8 +396,10 @@ comb-4 导频下每 4 个子载波有 1 个导频（128/4=32 个导频），导�
 
 - [wi-lab/lwm - HuggingFace](https://huggingface.co/wi-lab/lwm)：LWM 模型仓库与 README
 - LWM 论文：Alikhani et al., "Large Wireless Model (LWM): A Foundation Model for Wireless Channels", arXiv:2411.08872
-- [Sionna](https://nvlabs.github.io/sionna/)：NVIDIA 物理层仿真库（本项目的 3GPP OFDM 仿真为 NumPy 独立实现，风格对齐 Sionna）
-- 3GPP TR 38.901（信道模型）/ TS 38.211（物理信道）/ TR 38.900（TDL 模型）
+- [Sionna 2.x](https://nvlabs.github.io/sionna/phy/index.html)：标准 5G NR PUSCH 链路仿真库（PyTorch 后端）
+- [Sionna GitHub](https://github.com/NVlabs/sionna)：源码与示例
+- LWM 论文：Alikhani et al., "Large Wireless Model (LWM): A Foundation Model for Wireless Channels", arXiv:2411.08872
+- 3GPP TR 38.901（信道模型）/ TS 38.211（物理信道，DMRS/PUSCH）
 - 设计文档：`../LWM_LLR_Design_Doc.md`（本项目的总体设计）
 
 ---
