@@ -37,27 +37,34 @@ CKPT_PRETRAIN = os.path.join(WEIGHTS_DIR, "lwm_continued.pt")   # 阶段1: MCM �
 CKPT_LLR = os.path.join(WEIGHTS_DIR, "lwm_llr.pt")              # 阶段2: LLR 微调
 CKPT_LLR_NO_PT = os.path.join(WEIGHTS_DIR, "lwm_llr_no_pretrain.pt")  # 对照: 无继续预训练
 
-# ================= 训练超参数 =================
+# ================= 训练超参数（GPU 大规模版） =================
 # 阶段 1: MCM 继续预训练
-PT_N_SAMPLES = 1000        # 预训练样本数（每样本 14 符号 = 14 个 MCM 序列）
-PT_EPOCHS = 12
-PT_BATCH = 32
+PT_N_SAMPLES = 3000        # 预训练样本数（每样本 14 符号 = 14 个 MCM 序列）
+PT_EPOCHS = 30
+PT_BATCH = 16              # GPU 显存限制（6GB）
+PT_GRAD_ACCUM = 4          # 梯度累积（等效 batch 64）
 PT_LR = 1e-5
 PT_MASK_RATIO = 0.15
 PT_SEED = 0
 
 # 阶段 2: LLR 微调
-FT_TRAIN_N = 1200
-FT_VAL_N = 200
-FT_EPOCHS = 12
-FT_BATCH = 32
+FT_TRAIN_N = 3000
+FT_VAL_N = 300
+FT_EPOCHS = 30
+FT_BATCH = 16
+FT_GRAD_ACCUM = 4
 FT_LR = 1e-4              # decoder 学习率
 FT_LR_BACKBONE = 1e-6     # LWM 骨干学习率（微调）
 FT_FREEZE_BACKBONE = False
 FT_SEED = 1
 
+# 数据缓存（Sionna 生成一次，训练多次复用）
+CACHE_PT = os.path.join(DATA_DIR, "pusch_pt_train.npz")
+CACHE_FT_TRAIN = os.path.join(DATA_DIR, "pusch_ft_train.npz")
+CACHE_FT_VAL = os.path.join(DATA_DIR, "pusch_ft_val.npz")
+
 # 评估
-EVAL_N = 180              # 评估样本数（6 SNR × 30）
+EVAL_N = 300              # 评估样本数（6 SNR × 50）
 EVAL_SEED = 42
 EVAL_NSC_LIST = [120]   # 固定 120 子载波（Sionna PUSCH 10 RB）
 EVAL_SNR_LIST = [-5, 0, 5, 10, 15, 20]

@@ -14,6 +14,11 @@ Sionna 数据生成器（3GPP 5G NR PUSCH 标准实现）
 import numpy as np
 import torch
 
+# 数据生成统一在 CPU 上进行（Sionna 检测到 CUDA 会自动设全局 device=cuda，
+# 导致其内部组件 CPU/GPU 混合报错；数据生成非瓶颈，训练时数据再转 GPU）
+from sionna.phy import config as _sionna_cfg
+_sionna_cfg.device = "cpu"
+
 from sionna.phy.nr import (CarrierConfig, PUSCHDMRSConfig, PUSCHConfig,
                            PUSCHTransmitter, PUSCHLSChannelEstimator)
 from sionna.phy.ofdm import OFDMModulator, OFDMDemodulator

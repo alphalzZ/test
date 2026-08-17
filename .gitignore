@@ -213,3 +213,9 @@ config/secrets/
 # ---- DSH / 工具特定 ----
 *.dsh
 .dsh/
+
+# ---- LWM-LLR 项目：数据缓存与权重不入库 ----
+llr_project/data/
+llr_project/weights/
+*.npz
+*.h5

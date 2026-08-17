@@ -32,12 +32,13 @@
 
 **核心特性**：
 
-- ✅ 标准 Sionna PUSCH 链路仿真（DMRS type1 {1+1}、TDL-A 信道、LS-DFT 信道估计）
-- ✅ LWM 官方权重直接复用（0.6M 参数，CPU 可训练）
+- ✅ 标准 Sionna PUSCH 链路仿真（DMRS type1 {1+1}、TDL-A 信道、LS+插值信道估计）
+- ✅ LWM 官方权重直接复用（0.6M 参数）
 - ✅ 子载波对齐 tokenizer，模型输入维度 **{num_rx, num_sc, num_symb}** = (8, 120, 14)
 - ✅ **残差学习** Decoder：保证性能不劣于传统基线，专注"增强"
 - ✅ 完整的训练（MCM 继续预训练 + 监督微调）与评估（BER / LLR MSE）流水线
-- ✅ 全部 CPU 可运行，无 GPU 依赖
+- ✅ **CUDA GPU 加速**（自动检测，无 GPU 回退 CPU）；大规模训练下 **LLR MSE -19%、BER 5~20dB 全区间改善 13~20%**
+- ✅ 数据缓存（Sionna 生成一次，训练复用）
 
 ---
 
@@ -45,9 +46,9 @@
 
 ```
                     ┌────────────────────────────────────────────┐
-  信道矩阵 H_est     │   LWM 骨干（Transformer 编码器）             │
-  (8天线×128子载波)  │   子载波对齐 tokenizer → patch 序列          │
-        │           │   [CLS, patch_1, ..., patch_128]           │
+  信道估计 H_est     │   LWM 骨干（Transformer 编码器）             │
+  (8×120×14 3D)     │   逐 OFDM 符号 tokenizer → patch 序列       │
+        │           │   [CLS, patch_1, ..., patch_128] × 14 符号  │
         ▼           │         ↓                                 │
   ┌─────────┐       │   12 层双向注意力编码                        │
   │tokenizer│──────►│         ↓                                 │
@@ -77,10 +78,13 @@
 
 ### 3.1 系统要求
 
-- **Python**：3.10+（本项目在 3.14.4 上验证）
-- **CPU**：任意（模型仅 0.6M 参数；训练建议 4+ 核）
+- **Python**：3.11+（本项目在 3.14.4 上验证，Sionna 2.x 要求）
+- **CPU**：任意（模型仅 0.6M 参数）
 - **内存**：≥ 8GB（数据规模可调）
-- **GPU**：可选（代码自动检测 CUDA，无 GPU 自动回退 CPU）
+- **GPU**：**推荐**（CUDA 加速，训练快约 17 倍）；无 GPU 自动回退 CPU
+  - 本项目验证环境：RTX 3060 Laptop（6GB, sm_86, CUDA 13.2）
+  - 显存限制：6GB 下训练 batch=16 + 梯度累积=4（等效 batch 64）
+  - 若 GPU 显示 "requires reset"（驱动异常），需重启机器或让管理员执行 `nvidia-smi --gpu-reset`
 
 ### 3.2 依赖安装
 
@@ -118,9 +122,16 @@ chmod +x run_all.sh
 ./run_all.sh
 ```
 
-该脚本依次执行：MCM 继续预训练 → LLR 微调（主模型）→ LLR 微调（对照模型）→ 性能评估。**CPU 全流程约 1.5~2 小时**。
+该脚本依次执行：MCM 继续预训练 → LLR 微调（主模型）→ LLR 微调（对照模型）→ 性能评估。
 
-也可以分步执行，见第 7 节。
+**耗时参考**（本机验证）：
+
+| 硬件 | 阶段 | 耗时 |
+|------|------|------|
+| CPU | 全流程（小规模） | ~1.5~2 小时 |
+| **GPU** | 全流程（大规模 3000 样本 × 30 epoch） | **~1.7 小时** |
+
+也可以分步执行，见第 7 节。Sionna 数据首次生成会缓存到 `data/`（npz），后续训练直接加载复用。
 
 ---
 
@@ -174,14 +185,14 @@ chmod +x run_all.sh
 
 > 说明：DMRS 符号 2、11 全子载波为导频（2 CDM 组），**数据 RE 数 = 12 符号 × 120 子载波 = 1440**。LLR/比特只存在于数据 RE。模型输入 `H_est` 为完整 14 符号 × 120 子载波 × 8 天线的信道估计（用户要求的 `{num_rx, num_sc, num_symb}` 维度）。
 
-### 5.4 数据集规模（config.py 可调）
+### 5.4 数据集规模（config.py 可调，GPU 大规模版）
 
 | 用途 | 规模 | 说明 |
 |------|------|------|
-| 继续预训练 | 3000 | 只需信道，无标签 |
-| LLR 训练 | 4000 | 混合调制 + 随机 SNR |
-| LLR 验证 | 500 | |
-| 评估 | 384 | 4 种 N_sc × 6 种 SNR × 随机调制 |
+| 继续预训练 | 3000 | 只需信道，无标签；缓存 `data/pusch_pt_train.npz` |
+| LLR 训练 | 3000 | 混合调制 + 随机 SNR；缓存 `data/pusch_ft_train.npz` |
+| LLR 验证 | 300 | 缓存 `data/pusch_ft_val.npz` |
+| 评估 | 300 | 6 种 SNR × 50 样本，混合调制 |
 
 ---
 
@@ -189,18 +200,19 @@ chmod +x run_all.sh
 
 ```
 llr_project/
-├── config.py            # 全局配置：系统参数、路径、训练超参数
-├── data_gen_sionna.py   # Sionna PUSCH 数据生成器（标准 5G NR 链路）
+├── config.py            # 全局配置：系统参数、路径、训练超参数（GPU 版）
+├── data_gen_sionna.py   # Sionna PUSCH 数据生成器（标准 5G NR 链路，CPU 强制）
 ├── data_gen.py          # 工具函数（QAM 星座 / max-log LLR / demapper）
 ├── tokenizer.py         # 子载波对齐 patch tokenizer（含 3D 逐符号 tokenize）
-├── dataset.py           # PyTorch Dataset（含 llr_base 残差锚点预计算）
-├── model.py             # LWM 骨干（官方结构）+ 残差 LLR Decoder + 组合模型
-├── train_pretrain.py    # 阶段 1：MCM 继续预训练
-├── train_llr.py         # 阶段 2：LLR 微调（主/对照模式）
-├── evaluate.py          # 性能评估（4 方案对比 + BER 曲线）
+├── dataset.py           # PyTorch Dataset + 数据缓存（npz）
+├── model.py             # LWM 骨干（官方结构）+ 残差 LLR Decoder（3D 输入）
+├── train_pretrain.py    # 阶段 1：MCM 继续预训练（GPU 向量化）
+├── train_llr.py         # 阶段 2：LLR 微调（主/对照模式，GPU）
+├── evaluate.py          # 性能评估（基线/本方案/对照对比 + BER 曲线）
 ├── run_all.sh           # 一键运行脚本
 ├── REPORT.md            # 开发与评估报告
 ├── README.md            # 本文档
+├── data/                # Sionna 数据缓存（npz，训练复用）
 ├── weights/             # 训练产物
 │   ├── lwm_continued.pt       # 阶段1 继续预训练权重
 │   ├── lwm_llr.pt             # 阶段2 主模型（继续预训练 + LLR 微调）
@@ -218,18 +230,19 @@ llr_project/
 ```bash
 python train_pretrain.py
 # 可选参数：
-#   --epochs 15       训练轮数
+#   --epochs 30       训练轮数（默认 30）
 #   --samples 3000    样本数
-#   --batch 64        批大小
+#   --batch 16        批大小（6GB 显存上限；CPU 可调大）
+#   --grad-accum 4    梯度累积步数（等效 batch 64）
 #   --lr 1e-5         学习率（小 lr 防灾难性遗忘）
 #   --seed 0          随机种子
 ```
 
-**做了什么**：加载官方 LWM 权重 → 用自己的 3GPP OFDM 信道（H_est）做 **Masked Channel Modeling**：随机 mask 15% 的 patch，用 MSE 损失重建被 mask 的 patch。使 LWM 的隐空间适配 3GPP 信道分布。
+**做了什么**：加载官方 LWM 权重 → 用自己的 3GPP OFDM 信道（H_est）做 **Masked Channel Modeling**：逐 OFDM 符号随机 mask 15% 的 patch，用 MSE 损失重建被 mask 的 patch（**GPU 向量化实现**）。使 LWM 的隐空间适配 3GPP 信道分布。
 
-**产出**：`weights/lwm_continued.pt`
+**产出**：`weights/lwm_continued.pt`；数据缓存 `data/pusch_pt_train.npz`
 
-**参考效果**（本机 CPU）：MCM loss 0.607 → 0.492（15 epoch，约 22 分钟）。
+**参考效果**（GPU, 3000 样本 30 epoch）：MCM loss 0.586 → **0.426**（约 33 分钟；GPU 前向加速比约 17×）。
 
 ### 7.2 阶段 2：LLR 微调
 
@@ -241,11 +254,12 @@ python train_llr.py
 python train_llr.py --no-pretrain
 
 # 可选参数：
-#   --train-n 4000    训练样本数
-#   --val-n 500       验证样本数
-#   --epochs 25       训练轮数
-#   --batch 64        批大小
-#   --lr 3e-4         Decoder 学习率
+#   --train-n 3000    训练样本数
+#   --val-n 300       验证样本数
+#   --epochs 30       训练轮数
+#   --batch 16        批大小（6GB 显存上限）
+#   --grad-accum 4    梯度累积步数
+#   --lr 1e-4         Decoder 学习率
 #   --lr-backbone 1e-6  LWM 骨干学习率
 #   --freeze-backbone  冻结骨干只训 Decoder
 ```
@@ -254,7 +268,7 @@ python train_llr.py --no-pretrain
 
 **产出**：`weights/lwm_llr.pt`（主）、`weights/lwm_llr_no_pretrain.pt`（对照）
 
-**参考效果**：val MSE 0.45 → 0.029（25 epoch，约 45 分钟/模型）。
+**参考效果**（GPU, 3000 样本 30 epoch）：val MSE **0.00598**（约 35 分钟/模型）。
 
 ### 7.3 性能评估
 
@@ -278,36 +292,35 @@ python evaluate.py
 
 ---
 
-## 8. 实验结果
+## 8. 实验结果（GPU 大规模训练，300 评估样本）
 
-### 8.1 LLR MSE（384 评估样本，越小越好）
+### 8.1 LLR MSE（vs 理想 max-log，越小越好）
 
 | 方案 | MSE | vs 传统基线 |
 |------|-----|------------|
-| 理想上界（H_true） | 0.00 | — |
-| 传统基线（H_est） | 31.58 | — |
-| **LWM + Decoder（本方案）** | **29.99** | **-5.0%** ✅ |
-| LWM 对照（无继续预训练） | 30.00 | -5.0% |
+| 传统基线（H_est） | 4.260 | — |
+| **LWM + Decoder（本方案）** | **3.442** | **-19.2%** ✅ |
+| LWM 对照（无继续预训练） | 3.404 | -20.1% |
 
 ### 8.2 硬判决 BER（越低越好）
 
-| N_sc | SNR | ideal | base | LWM+Decoder |
-|------|-----|-------|------|-------------|
-| 32 | -5 dB | 0.196 | 0.341 | **0.336** |
-| 32 | 0 dB | 0.101 | 0.235 | **0.229** |
-| 32 | 5 dB | 0.064 | 0.143 | **0.131** |
-| 128 | -5 dB | 0.228 | 0.314 | **0.303** |
-| 128 | 0 dB | 0.114 | 0.151 | **0.150** |
-| 128 | 10 dB | 0.020 | 0.033 | 0.034 |
-| 2048 | -5 dB | 0.146 | 0.274 | 0.284 |
-| 2048 | 20 dB | 0.000 | 0.102 | 0.102 |
+| SNR | 传统基线 | **LWM+Decoder** | 改善 |
+|-----|---------|-----------------|------|
+| -5 dB | 0.263 | 0.259 | -1.5% |
+| 0 dB | 0.174 | 0.170 | -2.3% |
+| 5 dB | 0.091 | **0.078** | **-13.8%** ✅ |
+| **10 dB** | 0.161 | **0.128** | **-20.2%** ✅ |
+| 15 dB | 0.051 | **0.042** | **-18.4%** ✅ |
+| 20 dB | 0.040 | **0.035** | **-12.9%** ✅ |
+
+按调制阶数（全 SNR 平均 BER）：64QAM 0.212→0.186（-12%），256QAM 0.226→0.202（-11%）。
 
 ### 8.3 结论
 
-- **低 SNR（-5~5 dB）**：本方案 BER 系统性低于传统基线 —— 信道估计误差大时，LWM 利用信道先验做隐式去噪，修正 LLR 有效。
-- **高 SNR（≥10 dB）**：基线已接近理想，本方案与基线持平（残差设计保证不劣化）。
-- **LLR MSE 全面低于基线约 5%**。
-- **继续预训练增益**：当前设置下主模型与对照差异 <0.1%（15 epoch MCM 域适配不足，见第 11 节改进方向）。
+- **LWM 软解调增强有效**：LLR MSE 全面低于基线 **19.2%**；BER 在 **5~20 dB 全区间改善 13~20%**（中等 SNR 增益最大，此时信道估计误差适中，LWM 先验修正最有效）。
+- **残差设计保证不劣化**：所有 SNR 上 LWM 均不低于传统基线。
+- **大规模训练收益**：从 CPU 小规模（1200 样本 12 epoch）的 -2% MSE 提升到 GPU 大规模（3000 样本 30 epoch）的 **-19%** —— 数据量、epoch、MCM 域适配（loss 0.426）共同作用。
+- **继续预训练 vs 官方权重**：差异 <1.5%，骨干微调 lr 仍偏小（见第 11 节改进方向）。
 
 ---
 
@@ -345,15 +358,30 @@ Sionna PUSCH 链路输出完整频域信道估计 `H_est (8, 120, 14)`（rx × s
 
 ### 9.5 LWM 骨干微调策略
 
-- 默认微调（backbone lr=1e-6，远小于 decoder 的 3e-4）
+- 默认微调（backbone lr=1e-6，远小于 decoder 的 1e-4，防灾难性遗忘）
 - 可选 `--freeze-backbone` 冻结骨干（数据少时）
+- 实验结论：骨干 lr=1e-6 时继续预训练与官方权重差异 <1.5%，后续可尝试提高骨干 lr（见第 11 节）
+
+### 9.6 GPU 训练策略
+
+- 6GB 显存下 **batch=16 + 梯度累积=4**（等效 batch 64），`expandable_segments` 防碎片
+- 预训练 MCM 全程 GPU 向量化（tokenize 与 mask 均在 GPU）
+- Sionna 数据生成强制 CPU（避免其 CUDA 全局 device 导致 CPU/GPU 混合错误）
 
 ---
 
 ## 10. 常见问题（FAQ）
 
 **Q1：没有 GPU 能跑吗？**
-能。模型仅 0.6M 参数，全流程 CPU 可运行（约 2 小时）。代码自动检测 CUDA。
+能。模型仅 0.6M 参数，全流程 CPU 可运行（小规模约 2 小时）。代码自动检测 CUDA，有 GPU 自动加速（本机实测快约 17 倍）。
+
+**Q1b：有 GPU 但 `torch.cuda.is_available()` 为 False？**
+- 运行 `nvidia-smi`，若显示 **"GPU requires reset" / ERR**：GPU 驱动状态异常，需重启机器或让管理员执行 `sudo nvidia-smi --gpu-reset`
+- 检查驱动/CUDA 版本与 torch 匹配（本项目：驱动 595.84/CUDA 13.2 + torch 2.13.0+cu130）
+- 若报 `CUDA out of memory`：6GB 显存需 `--batch 16 --grad-accum 4`（见 config.py 默认值）
+
+**Q1c：Sionna 数据生成报 CPU/GPU 设备混合错误？**
+Sionna 检测到 CUDA 会自动把全局 device 设为 cuda，导致其内部组件 CPU/GPU 混合。本项目已在 `data_gen_sionna.py` 顶部强制 `sionna.config.device = "cpu"`（数据生成在 CPU，训练在 GPU），无需处理。
 
 **Q2：官方权重路径报错怎么办？**
 `config.py` 的 `LWM_OFFICIAL_CKPT` 默认指向 `../LWM/model_weights.pth`。确认已克隆 LWM 仓库并下载真实权重（注意 git-lfs 指针问题，见 3.3 节）。
@@ -369,26 +397,27 @@ curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 DMRS type1 + 2 CDM 组 + {1+1} 双符号配置下，符号 2 和 11 的全部 120 个子载波都是导频（不发送数据比特），无 LLR。数据 RE = 12 符号 × 120 子载波 = 1440。
 
 **Q5：如何用我自己的数据？**
-`data_gen.generate_sample()` 返回样本 dict（见 5.3 表）。用自己的数据时，只需保证字段一致：`H_est(8,N_sc)`、`z(n_data,)`、`sigma2`、`llr_ref(n_data,log2M)`、`bits_tx`、`mod_order`、`sigma2_eq`。可以改写 `generate_dataset()` 为读取自己的数据集。
+修改 `data_gen_sionna.py` 的 `SionnaPUSCHSystem`（信道模型、带宽、DMRS 配置等），或改写 `generate_dataset()` 读取自己的数据集。样本需保证字段一致（见 5.3 表）：`H_est(8,120,14)`、`z(1440,)`、`sigma2`、`llr_ref(1440,log2M)`、`bits_tx`、`mod_order`、`sigma2_eq`。
 
 **Q6：为什么继续预训练收益不明显？**
-15 epoch MCM 可能不足（loss 0.49 仍高），且骨干微调 lr 很小。改进建议见第 11 节。
+当前 MCM（30 epoch, loss 0.426）与官方权重对照的差异 <1.5%，主要因为骨干微调 lr=1e-6 过小。改进建议：提高骨干 lr（1e-4 量级）或两阶段训练（先冻骨干训 decoder，再联合微调），见第 11 节。
 
 **Q7：训练很慢怎么办？**
-- 减少 `--samples` / `--epochs`（先小规模验证）
-- 有 GPU 时设置 `CUDA_VISIBLE_DEVICES` 自动加速
-- 设置环境变量限制线程数避免过度争抢：`OMP_NUM_THREADS=8`
+- 使用 GPU（自动检测；`CUDA_VISIBLE_DEVICES` 指定设备）
+- 6GB 显存用默认 `--batch 16 --grad-accum 4`；显存更大可调大 batch
+- 数据缓存（`data/*.npz`）避免重复生成 Sionna 数据
+- CPU 上设置 `OMP_NUM_THREADS=8` 提升多核利用率
 
 ---
 
 ## 11. 后续改进方向
 
-1. **加强继续预训练**：MCM epochs 提到 50+、提高 backbone 微调 lr（1e-4 量级）、分两阶段（先冻骨干训 decoder，再联合微调）。
-2. **训练分布对齐推理**：训练时随机截断子载波数（模拟 32/512/2048 等短块），消除分块补零的分布偏移。
-3. **端到端评估**：接入 5G NR LDPC 译码器，用 BLER 作为最终落地指标（当前为硬判决 BER）。
-4. **改进 LLR 标签**：尝试精确后验（"app"）LLR 替代 max-log 近似，或加权损失。
-5. **模型结构探索**：取 LWM 浅层（3~6 层）特征、CLS embedding 全局增益分支、1D-CNN decoder（建模子载波相关性）。
-6. **多天线/多流扩展**：扩展到 8×2/8×4 MIMO，decoder 输出多流 LLR。
+1. **深挖继续预训练价值**：提高 backbone 微调 lr（1e-4 量级）或两阶段训练（先冻骨干训 decoder，再联合微调），充分发挥 MCM 域适配（当前 lr=1e-6 下主 vs 对照差异 <1.5%）。
+2. **端到端评估**：接入 5G NR LDPC 译码器，用 BLER 作为最终落地指标（当前为硬判决 BER）。
+3. **改进 LLR 标签**：尝试精确后验（"app"）LLR 替代 max-log 近似，或加权损失。
+4. **模型结构探索**：取 LWM 浅层（3~6 层）特征、CLS embedding 全局增益分支、1D-CNN decoder（建模子载波相关性）。
+5. **信道场景扩展**：TDL-B/C/D、多普勒、多 UE 干扰、不同带宽（更多 RB）。
+6. **更强基线对比**：LMMSE 插值器（`LMMSEInterpolator`）、迭代接收机。
 
 ---
 
@@ -398,10 +427,9 @@ DMRS type1 + 2 CDM 组 + {1+1} 双符号配置下，符号 2 和 11 的全部 12
 - LWM 论文：Alikhani et al., "Large Wireless Model (LWM): A Foundation Model for Wireless Channels", arXiv:2411.08872
 - [Sionna 2.x](https://nvlabs.github.io/sionna/phy/index.html)：标准 5G NR PUSCH 链路仿真库（PyTorch 后端）
 - [Sionna GitHub](https://github.com/NVlabs/sionna)：源码与示例
-- LWM 论文：Alikhani et al., "Large Wireless Model (LWM): A Foundation Model for Wireless Channels", arXiv:2411.08872
 - 3GPP TR 38.901（信道模型）/ TS 38.211（物理信道，DMRS/PUSCH）
 - 设计文档：`../LWM_LLR_Design_Doc.md`（本项目的总体设计）
 
 ---
 
-*最后更新：2026-08*　*环境：Python 3.14.4 / torch 2.13.0 / CPU*
+*最后更新：2026-08*　*环境：Python 3.14.4 / torch 2.13.0+cu130 / RTX 3060 Laptop (CUDA)*

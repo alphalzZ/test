@@ -107,3 +107,25 @@ class PretrainDataset(Dataset):
 
     def __getitem__(self, i):
         return self.H[i]
+
+
+# ================= 数据缓存（Sionna 生成一次，训练复用） =================
+
+def save_packed(path, packed):
+    """packed dict of numpy arrays -> npz"""
+    np.savez(path, **packed)
+
+
+def load_packed(path):
+    """npz -> dict of numpy arrays"""
+    with np.load(path, allow_pickle=True) as d:
+        return {k: d[k] for k in d.files}
+
+
+def save_pretrain_cache(path, H_arr):
+    np.savez(path, H_est=H_arr)
+
+
+def load_pretrain_cache(path):
+    with np.load(path) as d:
+        return d["H_est"]

@@ -266,6 +266,7 @@ class LWMLLR(nn.Module):
         -> llr (1440, log2M) float32
         """
         self.eval()
+        dev = next(self.parameters()).device
         H = np.asarray(H)
         assert H.shape == (config.N_ANT, N_SC_3D, N_SYMB_3D), H.shape
         mod_oh = np.zeros((1, config.MOD_ONHOT_DIM), dtype=np.float32)
@@ -274,11 +275,11 @@ class LWMLLR(nn.Module):
         llr_base = np.zeros((1, N_DATA, config.MAX_BITS), dtype=np.float32)
         llr_base[0, :, :btab.shape[1]] = demap_llr(z, sigma2_eq, X, btab, config.MAX_LLR)
         with torch.no_grad():
-            H_t = torch.tensor(H[None], dtype=torch.complex64)
-            z_t = torch.tensor(z[None], dtype=torch.complex64)
-            s2_t = torch.tensor([sigma2], dtype=torch.float32)
-            mo_t = torch.tensor(mod_oh, dtype=torch.float32)
-            lb_t = torch.tensor(llr_base, dtype=torch.float32)
+            H_t = torch.tensor(H[None], dtype=torch.complex64, device=dev)
+            z_t = torch.tensor(z[None], dtype=torch.complex64, device=dev)
+            s2_t = torch.tensor([sigma2], dtype=torch.float32, device=dev)
+            mo_t = torch.tensor(mod_oh, dtype=torch.float32, device=dev)
+            lb_t = torch.tensor(llr_base, dtype=torch.float32, device=dev)
             llr = self(H_t, z_t, s2_t, mo_t, lb_t)[0].cpu().numpy()
         return llr[:, :btab.shape[1]].astype(np.float32)
 
