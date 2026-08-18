@@ -21,27 +21,14 @@ print(f'  ckpt: {config.CKPT_LLR}')
 print(f'  cache: {config.CACHE_TRAIN}')
 "
 
-echo "========== [1/5] 数据生成（分集缓存，约 1.5~2 小时，一次性） =========="
-$PY << 'EOF'
-import os
+echo "========== [1/5] 数据生成（分片缓存，断点续跑，约 1.5~2 小时） =========="
+$PY -c "
+from dataset import build_data
 import config
-from data_gen_sionna import generate_dataset
-from dataset import save_samples_pkl
-
-def gen(name, n, seed, cache):
-    if os.path.exists(cache):
-        print(f"  [{name}] 缓存已存在: {cache}")
-        return
-    print(f"  [{name}] 生成 {n} 样本 (seed={seed}, group_size={config.GROUP_SIZE}) ...")
-    samples = generate_dataset(n, seed=seed, group_size=config.GROUP_SIZE)
-    save_samples_pkl(cache, samples)
-    print(f"  [{name}] 完成 -> {cache}")
-
-gen("train", config.TRAIN_N, config.SEED,       config.CACHE_TRAIN)
-gen("val",   config.VAL_N,   config.SEED + 1000, config.CACHE_VAL)
-gen("pt",    config.PT_N,    config.SEED + 2000, config.CACHE_PT)
-print("  数据全部就绪")
-EOF
+build_data(config.TRAIN_N, config.VAL_N, config.PT_N, config.SEED,
+           config.CACHE_TRAIN, config.CACHE_VAL, config.CACHE_PT)
+print('  数据全部就绪')
+"
 
 echo "========== [2/5] 阶段1: MCM 继续预训练（约 0.5 小时） =========="
 [ -f "$W/lwm_continued_night.pt" ] || $PY train_pretrain.py

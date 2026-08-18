@@ -76,6 +76,8 @@ EVAL_SEED = 42
 CACHE_PT = os.path.join(DATA_DIR, "pusch_pt.pkl")
 CACHE_TRAIN = os.path.join(DATA_DIR, "pusch_train.pkl")
 CACHE_VAL = os.path.join(DATA_DIR, "pusch_val.pkl")
+# 数据分片大小（生成时边生成边落盘，控制内存峰值；缓存为 path.000/001/... + manifest）
+SHARD_SIZE = 5000
 
 for d in (DATA_DIR, WEIGHTS_DIR):
     os.makedirs(d, exist_ok=True)

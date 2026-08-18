@@ -127,7 +127,7 @@ class BucketedLoader:
 # ================= 数据缓存（Sionna 生成一次，训练复用） =================
 
 def save_samples_pkl(path, samples):
-    """样本列表 -> pickle（形状随配置变化，不能用固定 npz）"""
+    """样本列表 -> 单文件 pickle（小规模缓存用）"""
     with open(path, "wb") as f:
         pickle.dump(samples, f)
 
@@ -137,27 +137,91 @@ def load_samples_pkl(path):
         return pickle.load(f)
 
 
+def save_shard(samples, path, shard_index):
+    """增量写一个分片（大规模生成时边生成边落盘，控制内存峰值）"""
+    with open(f"{path}.{shard_index:03d}", "wb") as f:
+        pickle.dump(samples, f)
+
+
+def save_samples_shards(samples, path, shard_size=None):
+    """整列表分片保存（path.000/001/... + path.manifest 记录片数）"""
+    ss = shard_size or config.SHARD_SIZE
+    n_shards = int(np.ceil(len(samples) / ss))
+    for si in range(n_shards):
+        save_shard(samples[si * ss:(si + 1) * ss], path, si)
+    with open(path + ".manifest", "w") as f:
+        f.write(str(n_shards))
+
+
+def load_samples_shards(path):
+    """加载分片缓存（无 manifest 时回退单文件 pkl，兼容旧缓存）"""
+    if not os.path.exists(path + ".manifest"):
+        return load_samples_pkl(path)
+    with open(path + ".manifest") as f:
+        n_shards = int(f.read().strip())
+    samples = []
+    for si in range(n_shards):
+        with open(f"{path}.{si:03d}", "rb") as f:
+            samples.extend(pickle.load(f))
+    return samples
+
+
+def _cache_ready(path):
+    """缓存是否已就绪（单文件；或分片缓存：manifest 存在且全部分片文件完整）"""
+    if os.path.exists(path):
+        return True
+    mf = path + ".manifest"
+    if not os.path.exists(mf):
+        return False
+    with open(mf) as f:
+        n_shards = int(f.read().strip())
+    return all(os.path.exists(f"{path}.{si:03d}") for si in range(n_shards))
+
+
 def build_data(n_train, n_val, n_pt, seed, cache_tr, cache_va, cache_pt,
-               group_size=None):
+               group_size=None, shard_size=None):
     """
     生成或加载多配置数据缓存（train/val/pt，大规模版：每组合 group_size 样本）。
+    ★ 分片生成：每个数据集按 SHARD_SIZE 分片，边生成边落盘（内存峰值=单片），
+      断点续跑粒度到分片级；训练时 load_samples_shards 合并加载。
     返回 (tr_samples, va_samples, pt_samples)。
     """
     from data_gen_sionna import generate_dataset
-    if all(os.path.exists(p) for p in (cache_tr, cache_va, cache_pt)):
+    if all(_cache_ready(p) for p in (cache_tr, cache_va, cache_pt)):
         print("[DATA] 加载缓存数据")
-        return (load_samples_pkl(cache_tr), load_samples_pkl(cache_va),
-                load_samples_pkl(cache_pt))
+        return (load_samples_shards(cache_tr), load_samples_shards(cache_va),
+                load_samples_shards(cache_pt))
+    import gc
     import time
     t0 = time.time()
     gs = group_size or config.GROUP_SIZE
+    ss = shard_size or config.SHARD_SIZE
     print(f"[DATA] 生成多配置数据: train={n_train}, val={n_val}, pt={n_pt} "
-          f"(seed={seed}, group_size={gs}) ...")
-    tr = generate_dataset(n_train, seed=seed, group_size=gs)
-    va = generate_dataset(n_val, seed=seed + 1000, group_size=gs)
-    pt = generate_dataset(n_pt, seed=seed + 2000, group_size=gs)
-    save_samples_pkl(cache_tr, tr)
-    save_samples_pkl(cache_va, va)
-    save_samples_pkl(cache_pt, pt)
-    print(f"[DATA] 数据就绪并缓存 ({time.time()-t0:.1f}s)")
-    return tr, va, pt
+          f"(seed={seed}, group_size={gs}, shard_size={ss}) ...")
+
+    def gen_and_save(name, n, seed_, cache):
+        if _cache_ready(cache):
+            print(f"  [{name}] 缓存已存在，跳过: {cache}")
+            return
+        n_shards = int(np.ceil(n / ss))
+        for si in range(n_shards):
+            sp = f"{cache}.{si:03d}"
+            if os.path.exists(sp):
+                continue                     # 断点续跑：跳过已完成分片
+            m = min(ss, n - si * ss)
+            part = generate_dataset(m, seed=seed_ + si, group_size=gs)
+            save_shard(part, cache, si)
+            del part
+            gc.collect()
+            print(f"  [{name}] 分片 {si + 1}/{n_shards} ({m} 样本) 完成，"
+                  f"累计 {time.time() - t0:.0f}s")
+        with open(cache + ".manifest", "w") as f:
+            f.write(str(n_shards))
+        print(f"  [{name}] 全部 {n} 样本就绪 -> {cache}.*")
+
+    gen_and_save("train", n_train, seed, cache_tr)
+    gen_and_save("val", n_val, seed + 1000, cache_va)
+    gen_and_save("pt", n_pt, seed + 2000, cache_pt)
+    print(f"[DATA] 数据就绪 ({time.time() - t0:.1f}s)")
+    return (load_samples_shards(cache_tr), load_samples_shards(cache_va),
+            load_samples_shards(cache_pt))
