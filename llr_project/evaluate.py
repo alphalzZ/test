@@ -47,6 +47,14 @@ def load_llr_model(ckpt, device="cpu"):
     return model
 
 
+def pearson_corr(a, b):
+    """尺度无关的 LLR 形状相似度（BCE 训练 logits 与 max-log 参考尺度不同）"""
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = float(np.sqrt((a ** 2).sum() * (b ** 2).sum()))
+    return float((a * b).sum() / denom) if denom > 0 else 0.0
+
+
 def eval_sample(sample, model=None, model_nopt=None):
     """对单样本计算各方案 LLR 与指标（数据 RE）"""
     H_true = sample["H_true"]     # (8,120,14)
@@ -66,17 +74,20 @@ def eval_sample(sample, model=None, model_nopt=None):
 
     out = {"snr_db": -10 * np.log10(sigma2), "mod": mod_order, "k": k}
     out["mse_base"] = float(np.mean((llr_base - llr_ref) ** 2))
+    out["corr_base"] = pearson_corr(llr_base, llr_ref)
     hard = (llr_base > 0).astype(int)
     out["ber_base"] = float(np.mean(hard != bits))
 
     if model is not None:
         llr_lwm = model.infer_llr(H_est, sample["z"], sigma2, mod_order)
         out["mse_lwm"] = float(np.mean((llr_lwm - llr_ref) ** 2))
+        out["corr_lwm"] = pearson_corr(llr_lwm, llr_ref)
         hard = (llr_lwm > 0).astype(int)
         out["ber_lwm"] = float(np.mean(hard != bits))
     if model_nopt is not None:
         llr_np = model_nopt.infer_llr(H_est, sample["z"], sigma2, mod_order)
         out["mse_lwm_nopt"] = float(np.mean((llr_np - llr_ref) ** 2))
+        out["corr_lwm_nopt"] = pearson_corr(llr_np, llr_ref)
         hard = (llr_np > 0).astype(int)
         out["ber_lwm_nopt"] = float(np.mean(hard != bits))
     return out
@@ -143,15 +154,17 @@ def main():
         ys_base.append(avg("ber_base"))
         ys_lwm.append(avg("ber_lwm"))
 
-    # ============ LLR MSE 汇总 ============
+    # ============ LLR MSE / 相关系数汇总 ============
     print("\n" + "=" * 70)
-    print("LLR MSE（vs 理想 max-log LLR，越小越好）")
+    print("LLR 指标（MSE vs 理想 max-log 越小越好；相关系数越接近 1 越好）")
+    print("注: BCE 训练的 logits 与 max-log 参考尺度不同，MSE 仅作参考，BER 为主指标")
     print("=" * 70)
     for key, name in [("mse_base", "base"), ("mse_lwm", "lwm"),
                       ("mse_lwm_nopt", "lwm_noPT")]:
         if any(key in r for r in results):
             v = float(np.mean([r[key] for r in results]))
-            print(f"  {name:<10}: {v:.4f}")
+            c = float(np.mean([r[key.replace("mse", "corr")] for r in results]))
+            print(f"  {name:<10}: MSE={v:.4f}  corr={c:.4f}")
 
     # ============ 按调制阶数 ============
     print("\n按调制阶数（BER, 全 SNR 平均）:")

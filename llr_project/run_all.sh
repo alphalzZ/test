@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# LWM LLR 预测 —— 一键运行：数据生成 -> 继续预训练 -> LLR 微调(主+对照) -> 评估
-# 用法: ./run_all.sh   (GPU 大规模约 1.7 小时；CPU 小规模约 2 小时)
+# LWM LLR 预测 —— 一键运行：数据生成 -> 继续预训练 -> LLR 微调(主+对照, BCE+CNN) -> 评估
+# 用法: ./run_all.sh   (GPU 大规模约 2 小时；CPU 小规模约 2 小时)
 set -e
 cd "$(dirname "$0")"
 PY=../.venv/bin/python

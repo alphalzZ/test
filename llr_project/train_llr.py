@@ -64,10 +64,11 @@ def bce_loss(pred, bits, valid, nbits):
 
 
 def val_ber(pred, bits, valid, nbits):
-    """硬判决 BER（LLR>0 -> bit1）"""
+    """硬判决 BER（LLR>0 -> bit1，越低越好）"""
     mask = valid.unsqueeze(-1) * bit_mask_like(nbits, pred.shape, pred.device)
     hard = (pred > 0).float()
-    return ((hard == bits.float()).float() * mask).sum() / (mask.sum() + 1e-6)
+    correct = ((hard == bits.float()).float() * mask).sum() / (mask.sum() + 1e-6)
+    return 1.0 - correct
 
 
 def train(args):
