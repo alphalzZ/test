@@ -79,3 +79,12 @@ CACHE_VAL = os.path.join(DATA_DIR, "pusch_val.pkl")
 
 for d in (DATA_DIR, WEIGHTS_DIR):
     os.makedirs(d, exist_ok=True)
+
+# ================= 可选配置覆盖（夜间大规模训练方案） =================
+# 存在 night_config.py 时加载并覆盖上方默认配置（数据规模/训练超参/缓存与权重路径）。
+# 不使用时删除 night_config.py 即可恢复默认小规模配置。
+NIGHT_CFG = os.path.join(BASE_DIR, "night_config.py")
+if os.path.exists(NIGHT_CFG):
+    with open(NIGHT_CFG, encoding="utf-8") as _f:
+        exec(compile(_f.read(), NIGHT_CFG, "exec"), globals())
+    print(f"[config] 已加载夜间训练配置: {NIGHT_CFG}")
