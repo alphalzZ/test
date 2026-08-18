@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-阶段 2：LLR 微调（设计文档第 6、7 节，GPU 加速，性能优化版）
+阶段 2：LLR 微调（v2 多配置版，GPU 加速）
 在 LWM（继续预训练或官方权重）之上训练 CNN LLR decoder。
 监督标签：真实传输的 0/1 bit（bits_tx），损失函数：BCE（binary cross-entropy）。
 模型输入不含 llr_base（无需传统软解调），decoder 为 CNN 残差网络（NNreceiver 风格）。
 
-- GPU 可用时自动使用 CUDA（batch 16 + 梯度累积等效 64）
-- Sionna 数据生成一次缓存到 data/，训练直接加载
+v2 多配置：一个模型适配 天线 1/2/4/8 × RB 1~10 × 符号 3~14 × DMRS {1}/{1+1}/{1+2}
+× TDL-A/B/C/D × 时延/多普勒，训练数据为各种配置的混合（小数据量验证）。
+训练时按 (n_sc, n_symb) 分桶（batch 内同配置，CNN 特征图尺寸一致）。
 
 用法：
   python train_llr.py                       # 用阶段1权重微调（主模型）
@@ -24,29 +25,9 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from data_gen_sionna import generate_dataset
-from dataset import (LLRDataset, llr_collate, pack_samples,
-                     save_packed, load_packed)
+from dataset import (BucketedLoader, build_v2_data,
+                     load_samples_pkl, save_samples_pkl)
 from model import LWMLLR, load_official_backbone
-
-
-def build_ft_data(n_train, n_val, seed, cache_tr, cache_va):
-    """生成或加载缓存"""
-    if os.path.exists(cache_tr) and os.path.exists(cache_va):
-        print(f"[FT] 加载缓存数据")
-        return load_packed(cache_tr), load_packed(cache_va)
-    print(f"[FT] 生成微调数据: train={n_train}, val={n_val} (seed={seed}) ...")
-    t0 = time.time()
-    tr = generate_dataset(n_train, num_rx_ant=config.N_ANT,
-                          n_size_grid=config.N_SC // 12, seed=seed)
-    va = generate_dataset(n_val, num_rx_ant=config.N_ANT,
-                          n_size_grid=config.N_SC // 12, seed=seed + 1000)
-    tr_p = pack_samples(tr)
-    va_p = pack_samples(va)
-    save_packed(cache_tr, tr_p)
-    save_packed(cache_va, va_p)
-    print(f"[FT] 数据就绪并缓存 ({time.time()-t0:.1f}s)")
-    return tr_p, va_p
 
 
 def bit_mask_like(nbits, shape, device):
@@ -71,6 +52,21 @@ def val_ber(pred, bits, valid, nbits):
     return 1.0 - correct
 
 
+def to_tensors(b, device):
+    """collate_v2 的 numpy dict -> GPU tensors（data_re_idx 保留 numpy）"""
+    return {
+        "H_est": torch.tensor(b["H_est"], device=device),
+        "z": torch.tensor(b["z"], device=device),
+        "bits": torch.tensor(b["bits"], device=device),
+        "mod_oh": torch.tensor(b["mod_oh"], device=device),
+        "sigma2": torch.tensor(b["sigma2"], device=device),
+        "valid": torch.tensor(b["valid"], device=device),
+        "nbits": torch.tensor(b["nbits"], device=device),
+        "cfg_v": torch.tensor(b["cfg_v"], device=device),
+        "data_re_idx": b["data_re_idx"],
+    }
+
+
 def train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -79,28 +75,28 @@ def train(args):
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     print(f"[FT] device={device}")
 
-    tr_p, va_p = build_ft_data(args.train_n, args.val_n, seed=args.seed,
-                               cache_tr=config.CACHE_FT_TRAIN,
-                               cache_va=config.CACHE_FT_VAL)
-    tr_ds = LLRDataset(tr_p)
-    va_ds = LLRDataset(va_p)
-    tr_loader = torch.utils.data.DataLoader(tr_ds, batch_size=args.batch, shuffle=True,
-                                            collate_fn=llr_collate)
-    va_loader = torch.utils.data.DataLoader(va_ds, batch_size=args.batch, shuffle=False,
-                                            collate_fn=llr_collate)
+    tr, va, _ = build_v2_data(args.train_n, args.val_n, args.pt_n,
+                              seed=args.seed,
+                              cache_tr=config.CACHE_V2_TRAIN,
+                              cache_va=config.CACHE_V2_VAL,
+                              cache_pt=config.CACHE_V2_PT)
+    tr_loader = BucketedLoader(tr, batch_size=args.batch, shuffle=True, seed=args.seed)
+    va_loader = BucketedLoader(va, batch_size=args.batch, shuffle=False, seed=0)
+    print(f"[FT] 训练样本 {len(tr)}（{tr_loader.n_groups} 种 (n_sc,n_symb) 配置），"
+          f"验证样本 {len(va)}（{va_loader.n_groups} 种配置）")
 
     # 骨干初始化
     if args.no_pretrain:
         backbone = load_official_backbone(device=device)
-        ckpt_out = config.CKPT_LLR_NO_PT
+        ckpt_out = config.CKPT_LLR_NO_PT_V2
         print("[FT] 对照模式：使用官方权重（无继续预训练）")
     else:
-        if not os.path.exists(config.CKPT_PRETRAIN):
-            raise FileNotFoundError(f"未找到继续预训练权重 {config.CKPT_PRETRAIN}，请先运行 train_pretrain.py")
+        if not os.path.exists(config.CKPT_PRETRAIN_V2):
+            raise FileNotFoundError(f"未找到继续预训练权重 {config.CKPT_PRETRAIN_V2}，请先运行 train_pretrain.py")
         bb = load_official_backbone(device=device)
-        bb.load_state_dict(torch.load(config.CKPT_PRETRAIN, map_location=device))
+        bb.load_state_dict(torch.load(config.CKPT_PRETRAIN_V2, map_location=device))
         backbone = bb
-        ckpt_out = config.CKPT_LLR
+        ckpt_out = config.CKPT_LLR_V2
         print("[FT] 主模式：加载继续预训练权重")
 
     model = LWMLLR(backbone, freeze_backbone=args.freeze_backbone).to(device)
@@ -122,35 +118,38 @@ def train(args):
         t0 = time.time()
         model.train()
         run = 0.0
+        n_batch = 0
         optimizer.zero_grad()
-        for bi, (H, z, llr, llr_base, bits, mo, s2, valid, nbits) in enumerate(tr_loader):
-            H, z, mo, s2, bits, valid, nbits = (
-                H.to(device), z.to(device), mo.to(device), s2.to(device),
-                bits.to(device), valid.to(device), nbits.to(device))
-            pred = model(H, z, s2, mo)                       # (B, 1440, 8) logits
-            loss = bce_loss(pred, bits, valid, nbits) / args.grad_accum
+        for b in tr_loader:
+            t = to_tensors(b, device)
+            # batch 内同配置，data_re_idx 取第 0 个即可（(n_data, 2)）
+            pred = model(t["H_est"], t["z"], t["sigma2"], t["mod_oh"],
+                         t["data_re_idx"][0], t["cfg_v"])
+            loss = bce_loss(pred, t["bits"], t["valid"], t["nbits"]) / args.grad_accum
             loss.backward()
-            if (bi + 1) % args.grad_accum == 0:
+            if (n_batch + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
             run += loss.item() * args.grad_accum
+            n_batch += 1
 
         # 验证
         model.eval()
         vrun = 0.0
         vber = 0.0
+        n_vb = 0
         with torch.no_grad():
-            for H, z, llr, llr_base, bits, mo, s2, valid, nbits in va_loader:
-                H, z, mo, s2, bits, valid, nbits = (
-                    H.to(device), z.to(device), mo.to(device), s2.to(device),
-                    bits.to(device), valid.to(device), nbits.to(device))
-                pred = model(H, z, s2, mo)
-                vrun += bce_loss(pred, bits, valid, nbits).item()
-                vber += val_ber(pred, bits, valid, nbits).item()
-        tl = run / len(tr_loader)
-        vl = vrun / len(va_loader)
-        vb = vber / len(va_loader)
+            for b in va_loader:
+                t = to_tensors(b, device)
+                pred = model(t["H_est"], t["z"], t["sigma2"], t["mod_oh"],
+                             t["data_re_idx"][0], t["cfg_v"])
+                vrun += bce_loss(pred, t["bits"], t["valid"], t["nbits"]).item()
+                vber += val_ber(pred, t["bits"], t["valid"], t["nbits"]).item()
+                n_vb += 1
+        tl = run / max(n_batch, 1)
+        vl = vrun / max(n_vb, 1)
+        vb = vber / max(n_vb, 1)
         print(f"[FT] epoch {epoch}/{args.epochs}  train={tl:.5f}  val={vl:.5f}  "
               f"valBER={vb:.4f}  ({time.time()-t0:.1f}s)")
         if vl < best_val:
@@ -163,14 +162,15 @@ def train(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--train-n", type=int, default=config.FT_TRAIN_N)
-    p.add_argument("--val-n", type=int, default=config.FT_VAL_N)
-    p.add_argument("--epochs", type=int, default=config.FT_EPOCHS)
-    p.add_argument("--batch", type=int, default=config.FT_BATCH)
-    p.add_argument("--grad-accum", type=int, default=config.FT_GRAD_ACCUM)
-    p.add_argument("--lr", type=float, default=config.FT_LR)
-    p.add_argument("--lr-backbone", type=float, default=config.FT_LR_BACKBONE)
-    p.add_argument("--seed", type=int, default=config.FT_SEED)
+    p.add_argument("--train-n", type=int, default=config.V2_TRAIN_N)
+    p.add_argument("--val-n", type=int, default=config.V2_VAL_N)
+    p.add_argument("--pt-n", type=int, default=config.V2_PT_N)
+    p.add_argument("--epochs", type=int, default=config.V2_FT_EPOCHS)
+    p.add_argument("--batch", type=int, default=config.V2_BATCH)
+    p.add_argument("--grad-accum", type=int, default=config.V2_GRAD_ACCUM)
+    p.add_argument("--lr", type=float, default=config.V2_LR)
+    p.add_argument("--lr-backbone", type=float, default=config.V2_LR_BACKBONE)
+    p.add_argument("--seed", type=int, default=config.V2_SEED)
     p.add_argument("--no-pretrain", action="store_true", help="对照：官方权重直接微调")
     p.add_argument("--freeze-backbone", action="store_true", help="冻结骨干只训 decoder")
     train(p.parse_args())

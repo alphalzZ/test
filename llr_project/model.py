@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-模型定义（设计文档第 5、6 节，性能优化版）：
+模型定义（设计文档第 5、6 节，性能优化 + 多配置自适应版）：
   1. LWM 骨干：与官方 lwm_model.py 结构完全一致（保证可加载官方权重），
      新增 encode() 返回逐 patch 隐状态。
   2. CNNLLRDecoder：CNN 残差网络（参考 NNreceiver 架构）。
      输入 = 全网格特征图 [channel_emb(64) + H_patch(16) + Re(z) + Im(z)
             + σ² + mod_onehot(4)]（不含 llr_base，免去传统软解调，降低复杂度）
      输出 = 逐数据 RE 的逐比特 LLR logits（正=bit1）。
-  3. LWMLLR：组合模型，输入 (H, z, σ², mod_onehot) -> (B, T, 8) LLR
+  3. LWMLLR：组合模型，输入 (H, z, σ², mod_onehot, data_re_idx) -> (B, T, 8) LLR。
+     多配置自适应：接收天线 1/2/4/8（补零到 8）、子载波 1~10 RB（序列长度自适应）、
+     符号数 3~14、DMRS {1}/{1+1}/{1+2}（数据 RE 索引随样本传入）。
 """
 import os
 import torch
@@ -160,7 +162,9 @@ class lwm(nn.Module):
 # 优化点：不再输入 llr_base（传统 max-log 软解调结果），直接由 CNN 在
 # (符号 × 子载波) 全网格上预测逐比特 LLR logits，降低推理复杂度。
 
-FEAT_CH = 88   # 特征通道数：64(emb)+16(H patch)+2(Re/Im z)+1(σ²)+4(mod_oh)=87，补零到 88 满足 GroupNorm(groups=2)
+# 特征通道数：64(emb)+16(H patch)+2(Re/Im z)+1(σ²)+4(mod_oh)=87
+# + 配置元数据 CFG_DIM=14（接收机已知的系统参数）-> 101，补零到 102 满足 GroupNorm(groups=2)
+FEAT_CH = 87 + config.CFG_DIM + (1 if (87 + config.CFG_DIM) % 2 else 0)
 
 
 class CNNResidualBlock(nn.Module):
@@ -269,10 +273,14 @@ DATA_SYMB = DATA_RE_IDX[:, 1]
 
 
 class LWMLLR(nn.Module):
-    """LWM 骨干 + CNN LLR decoder。
-    输入 3D 信道 H (B,8,120,14) -> 数据 RE 的逐比特 LLR。
+    """LWM 骨干 + CNN LLR decoder（v2 多配置自适应版）。
+    输入 3D 信道 H (B, n_rx, n_sc, n_symb) -> 数据 RE 的逐比特 LLR。
+    适配：n_rx∈{1,2,4,8}（补零到 8）、n_sc∈{12,...,120}（1~10 RB，序列长度自适应）、
+    n_symb∈{3,...,14}、DMRS {1}/{1+1}/{1+2}（数据 RE 索引随样本传入）。
     性能优化：输入不含 llr_base（无需传统软解调），decoder 为 CNN 残差网络。
     """
+
+    MAX_RX_ANT = 8   # patch 维度 16 与官方 LWM embedding 对齐，天线不足补零
 
     def __init__(self, backbone=None, freeze_backbone=False, device="cpu"):
         super().__init__()
@@ -285,76 +293,90 @@ class LWMLLR(nn.Module):
     @staticmethod
     def _tokenize_3d(H):
         """
-        H: (B, 8, 120, 14) complex -> input_ids (B*14, 129, 16) float
-        逐 OFDM 符号 tokenize：每符号 (8,120) -> 120 patches (+8 pad) + CLS = 129。
+        H: (B, n_rx, n_sc, n_symb) complex（n_rx<=8）-> input_ids (B*n_symb, n_sc+1, 16)
+        逐 OFDM 符号 tokenize：天线补零到 8 -> 每符号 n_sc patches + CLS（长度自适应，
+        n_sc+1 <= 121 <= LWM MAX_LEN=129）。
         """
-        B, _, _, S = H.shape
-        real = H.real.permute(0, 3, 2, 1)   # (B, S, 120, 8)
+        B, n_rx, n_sc, S = H.shape
+        if n_rx < LWMLLR.MAX_RX_ANT:
+            pad = torch.zeros(B, LWMLLR.MAX_RX_ANT - n_rx, n_sc, S,
+                              dtype=H.dtype, device=H.device)
+            H = torch.cat([H, pad], dim=1)
+        real = H.real.permute(0, 3, 2, 1)   # (B, S, n_sc, 8)
         imag = H.imag.permute(0, 3, 2, 1)
-        patches = torch.cat([real, imag], dim=-1)          # (B, S, 120, 16)
-        pad = torch.zeros(B, S, 8, 16, dtype=patches.dtype, device=H.device)
-        patches = torch.cat([patches, pad], dim=2)         # (B, S, 128, 16)
+        patches = torch.cat([real, imag], dim=-1)          # (B, S, n_sc, 16)
         cls = 0.2 * torch.ones(B, S, 1, 16, dtype=patches.dtype, device=H.device)
-        seq = torch.cat([cls, patches], dim=2)             # (B, S, 129, 16)
-        return seq.reshape(B * S, 129, 16)
+        seq = torch.cat([cls, patches], dim=2)             # (B, S, n_sc+1, 16)
+        return seq.reshape(B * S, n_sc + 1, 16)
 
     @staticmethod
-    def _build_feat(h_emb, patch, z, sigma2, mod_oh):
+    def _build_feat(h_emb, patch, z, sigma2, mod_oh, data_re_idx, cfg):
         """
-        构建 CNN 输入特征图 (B, 88, n_symb, n_sc)：
-          通道 = channel_emb(64) + H_patch(16) + Re(z) + Im(z) + σ² + mod_oh(4) = 87，
-          补零到 88 满足 GroupNorm(groups=2)。
-          z 仅存在于数据 RE 位置（其余位置为 0，由 CNN 利用网格上下文）。
+        构建 CNN 输入特征图 (B, FEAT_CH, n_symb, n_sc)：
+          通道 = channel_emb(64) + H_patch(16) + Re(z) + Im(z) + σ² + mod_oh(4)
+               + 配置元数据 cfg(CFG_DIM) = 87+CFG_DIM，补零到偶数满足 GroupNorm(2)。
+          z 仅在数据 RE 位置有值（data_re_idx 为 (n_data,2) [sc,symb]），其余为 0。
+          cfg: (B, CFG_DIM) 接收机已知的系统参数（天线/RB/符号/DMRS/TDL/速度）。
         """
         B = h_emb.shape[0]
+        S, SC = h_emb.shape[1], h_emb.shape[2]
         dev = h_emb.device
         feat = torch.cat([h_emb, patch], dim=-1)            # (B, S, SC, 80)
-        z_re = torch.zeros(B, N_SYMB_3D, N_SC_3D, device=dev, dtype=torch.float32)
+        z_re = torch.zeros(B, S, SC, device=dev, dtype=torch.float32)
         z_im = torch.zeros_like(z_re)
-        b_idx = torch.arange(B, device=dev)[:, None].expand(B, N_DATA).reshape(-1)
-        s_idx = torch.as_tensor(DATA_SYMB, device=dev)[None, :].expand(B, N_DATA).reshape(-1)
-        c_idx = torch.as_tensor(DATA_SC, device=dev)[None, :].expand(B, N_DATA).reshape(-1)
+        n_data = len(data_re_idx)
+        b_idx = torch.arange(B, device=dev)[:, None].expand(B, n_data).reshape(-1)
+        s_idx = torch.as_tensor(data_re_idx[:, 1], device=dev)[None, :].expand(B, n_data).reshape(-1)
+        c_idx = torch.as_tensor(data_re_idx[:, 0], device=dev)[None, :].expand(B, n_data).reshape(-1)
         z_re.index_put_((b_idx, s_idx, c_idx), z.real.reshape(-1))
         z_im.index_put_((b_idx, s_idx, c_idx), z.imag.reshape(-1))
         feat = torch.cat([feat, z_re[..., None], z_im[..., None]], dim=-1)  # (B, S, SC, 82)
-        s2 = sigma2.reshape(B, 1, 1, 1).expand(B, N_SYMB_3D, N_SC_3D, 1)
-        mo = mod_oh.reshape(B, 1, 1, -1).expand(B, N_SYMB_3D, N_SC_3D, -1)
-        feat = torch.cat([feat, s2, mo], dim=-1)            # (B, S, SC, 87)
-        feat = F.pad(feat, (0, 1))                          # 87 -> 88
-        return feat.permute(0, 3, 1, 2)                     # (B, 88, S, SC)
+        s2 = sigma2.reshape(B, 1, 1, 1).expand(B, S, SC, 1)
+        mo = mod_oh.reshape(B, 1, 1, -1).expand(B, S, SC, -1)
+        cfg_v = cfg.reshape(B, 1, 1, -1).expand(B, S, SC, -1)
+        feat = torch.cat([feat, s2, mo, cfg_v], dim=-1)     # (B, S, SC, 87+CFG_DIM)
+        n_pad = FEAT_CH - feat.shape[-1]
+        if n_pad > 0:
+            feat = F.pad(feat, (0, n_pad))                  # 补零到偶数
+        return feat.permute(0, 3, 1, 2)                     # (B, FEAT_CH, S, SC)
 
-    def forward(self, H, z, sigma2, mod_oh):
+    def forward(self, H, z, sigma2, mod_oh, data_re_idx, cfg):
         """
-        H: (B, 8, 120, 14) complex（Sionna PUSCH 3D 信道，含 DMRS 符号）
-        z: (B, 1440) complex（数据 RE 均衡符号）
+        H: (B, n_rx, n_sc, n_symb) complex（Sionna PUSCH 3D 信道，含 DMRS 符号）
+        z: (B, n_data) complex（数据 RE 均衡符号）
         sigma2: (B,)
         mod_oh: (B, 4)
-        -> llr (B, 1440, 8)（LLR logits，正=bit1，裁剪到 ±MAX_LLR）
+        data_re_idx: (n_data, 2) int [sc, symb]（本样本配置的数据 RE 索引）
+        cfg: (B, CFG_DIM) 系统配置元数据
+        -> llr (B, n_data, 8)（LLR logits，正=bit1，裁剪到 ±MAX_LLR）
         """
-        B = H.shape[0]
-        input_ids = self._tokenize_3d(H)               # (B*14, 129, 16)
-        output = self.backbone.encode(input_ids)       # (B*14, 129, 64)
-        h_emb = output[:, 1:1 + N_SC_3D, :].reshape(B, N_SYMB_3D, N_SC_3D, -1)   # (B, 14, 120, 64)
-        patch = input_ids[:, 1:1 + N_SC_3D, :].reshape(B, N_SYMB_3D, N_SC_3D, -1)  # (B, 14, 120, 16)
-        feat = self._build_feat(h_emb, patch, z, sigma2, mod_oh)  # (B, 88, 14, 120)
-        logits = self.decoder(feat)                    # (B, 8, 14, 120)
-        logits = logits.permute(0, 2, 3, 1)            # (B, 14, 120, 8)
-        llr = logits[:, DATA_SYMB, DATA_SC, :]         # (B, 1440, 8)
+        B, _, n_sc, n_symb = H.shape
+        input_ids = self._tokenize_3d(H)               # (B*n_symb, n_sc+1, 16)
+        output = self.backbone.encode(input_ids)       # (B*n_symb, n_sc+1, 64)
+        h_emb = output[:, 1:1 + n_sc, :].reshape(B, n_symb, n_sc, -1)   # (B, S, SC, 64)
+        patch = input_ids[:, 1:1 + n_sc, :].reshape(B, n_symb, n_sc, -1)  # (B, S, SC, 16)
+        feat = self._build_feat(h_emb, patch, z, sigma2, mod_oh, data_re_idx, cfg)  # (B,FEAT_CH,S,SC)
+        logits = self.decoder(feat)                    # (B, 8, S, SC)
+        logits = logits.permute(0, 2, 3, 1)            # (B, S, SC, 8)
+        dr = np.asarray(data_re_idx)
+        llr = logits[:, dr[:, 1], dr[:, 0], :]         # (B, n_data, 8)
         return torch.clamp(llr, -config.MAX_LLR, config.MAX_LLR)
 
-    def infer_llr(self, H, z, sigma2, mod_order):
+    def infer_llr(self, H, z, sigma2, mod_order, data_re_idx, cfg):
         """
-        推理入口（Sionna 3D 信道）。
-        H: (8, 120, 14) complex
-        z: (1440,) complex（数据 RE 均衡符号）
+        推理入口（v2 多配置）。
+        H: (n_rx, n_sc, n_symb) complex
+        z: (n_data,) complex（数据 RE 均衡符号）
         sigma2: float
         mod_order: int
-        -> llr (1440, log2M) float32
+        data_re_idx: (n_data, 2) int [sc, symb]
+        cfg: (CFG_DIM,) 系统配置元数据
+        -> llr (n_data, log2M) float32
         """
         self.eval()
         dev = next(self.parameters()).device
         H = np.asarray(H)
-        assert H.shape == (config.N_ANT, N_SC_3D, N_SYMB_3D), H.shape
+        assert H.ndim == 3 and H.shape[0] <= 8, H.shape
         mod_oh = np.zeros((1, config.MOD_ONHOT_DIM), dtype=np.float32)
         mod_oh[0, config.MOD_ORDERS.index(mod_order)] = 1.0
         X, btab = qam_constellation(mod_order)
@@ -363,7 +385,8 @@ class LWMLLR(nn.Module):
             z_t = torch.tensor(z[None], dtype=torch.complex64, device=dev)
             s2_t = torch.tensor([sigma2], dtype=torch.float32, device=dev)
             mo_t = torch.tensor(mod_oh, dtype=torch.float32, device=dev)
-            llr = self(H_t, z_t, s2_t, mo_t)[0].cpu().numpy()
+            cfg_t = torch.tensor(np.asarray(cfg, dtype=np.float32)[None], device=dev)
+            llr = self(H_t, z_t, s2_t, mo_t, data_re_idx, cfg_t)[0].cpu().numpy()
         return llr[:, :btab.shape[1]].astype(np.float32)
 
 
@@ -376,18 +399,31 @@ def load_official_backbone(device="cpu"):
 
 
 if __name__ == "__main__":
-    # 冒烟测试：官方权重加载 + 3D 前向（无 llr_base）
+    # 冒烟测试：官方权重加载 + 多配置 3D 前向（无 llr_base，自适应维度）
     bb = load_official_backbone()
     model = LWMLLR(bb).eval()
-    H = torch.randn(2, 8, 120, 14, dtype=torch.complex64)
-    z = torch.randn(2, N_DATA, dtype=torch.complex64)
+    from tokenizer import data_re_index
+    cfg = torch.zeros(2, config.CFG_DIM)
+    # 配置1: 4 天线, 4 RB, 7 符号, DMRS {1}（符号2）
+    dri = data_re_index(n_sc=48, n_symb=7, dmrs_symbs=(2,))
+    H = torch.randn(2, 4, 48, 7, dtype=torch.complex64)
+    z = torch.randn(2, len(dri), dtype=torch.complex64)
     s2 = torch.tensor([0.1, 0.2])
-    mo = torch.zeros(2, 4)
-    mo[:, 1] = 1.0
-    out = model(H, z, s2, mo)
-    print("LWMLLR output:", tuple(out.shape), out.dtype)
+    mo = torch.zeros(2, 4); mo[:, 1] = 1.0
+    out = model(H, z, s2, mo, dri, cfg)
+    print("config1 (4rx,48sc,7symb):", tuple(out.shape))
+    # 配置2: 8 天线, 10 RB, 14 符号, DMRS {1+2}（符号 2/7/11）
+    dri2 = data_re_index(n_sc=120, n_symb=14, dmrs_symbs=(2, 7, 11))
+    H2 = torch.randn(2, 8, 120, 14, dtype=torch.complex64)
+    z2 = torch.randn(2, len(dri2), dtype=torch.complex64)
+    out2 = model(H2, z2, s2, mo, dri2, cfg)
+    print("config2 (8rx,120sc,14symb):", tuple(out2.shape))
+    # 配置3: 1 天线, 1 RB, 3 符号, DMRS {1}（符号0, mapping B）
+    dri3 = data_re_index(n_sc=12, n_symb=3, dmrs_symbs=(0,))
+    H3 = torch.randn(2, 1, 12, 3, dtype=torch.complex64)
+    z3 = torch.randn(2, len(dri3), dtype=torch.complex64)
+    out3 = model(H3, z3, s2, mo, dri3, cfg)
+    print("config3 (1rx,12sc,3symb):", tuple(out3.shape))
     n_params = sum(p.numel() for p in model.parameters())
     print("total params:", n_params)
-    dec_params = sum(p.numel() for p in model.decoder.parameters())
-    print("decoder params:", dec_params)
     print("model OK")

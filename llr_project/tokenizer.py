@@ -81,6 +81,25 @@ def tokenize_3d(H, block_size=BLOCK_SIZE):
     return np.stack(blocks)   # (n_symb, 129, 16)
 
 
+def tokenize_3d_var(H):
+    """
+    v2（多配置）版本：H: (N_ant, N_sc, N_symb) complex（N_ant<=8, N_sc<=120, N_symb<=14）
+    -> (n_symb, n_sc+1, 16) float32，序列 = [CLS] + 逐子载波 patch（不补零到 128，
+    长度 n_sc+1 <= 121 <= LWM MAX_LEN=129，直接适配任意 RB 数）。
+    """
+    H = np.asarray(H)
+    n_ant, n_sc, n_symb = H.shape
+    real = H.real.T                        # (n_sc, n_ant)
+    imag = H.imag.T
+    patches = np.concatenate([real, imag], axis=1).astype(np.float32)  # (n_sc, 2*n_ant)
+    if n_ant < 8:                          # 天线补零到 8（16 维 patch，复用官方 embedding）
+        pad = np.zeros((n_sc, 16 - 2 * n_ant), dtype=np.float32)
+        patches = np.concatenate([patches, pad], axis=1)
+    cls = np.tile(CLS_TOKEN[None, :], (1, 1))
+    seq = np.concatenate([cls, patches], axis=0)     # (n_sc+1, 16)
+    return np.stack([seq] * n_symb)                  # (n_symb, n_sc+1, 16)
+
+
 def make_mcm_batch(blocks, mask_ratio=0.15, rng=None):
     """
     构造 MCM 训练 batch。
