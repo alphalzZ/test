@@ -1,140 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-PyTorch Dataset / collate：Sionna PUSCH 样本 -> 训练 batch
+PyTorch Dataset 工具：多配置样本 -> 桶式训练 batch
 
-样本格式（data_gen_sionna 输出，3D 信道）：
-  H_est(8,120,14)complex, H_true(8,120,14)complex, z(n_data,)complex,
+样本格式（data_gen_sionna 输出，多配置自适应）：
+  H_est(n_rx,n_sc,n_symb)complex, H_true, z(n_data,)complex,
   sigma2, sigma2_eq(n_data,), llr_ref(n_data,log2M), bits_tx(n_data,log2M),
-  mod_order, n_sc, n_symb, n_data, data_re_idx
+  mod_order, n_rx/n_sc/n_symb/n_data, dmrs_ap/tdl/delay_spread/max_speed,
+  data_re_idx(n_data,2), snr_db, cfg
 
-n_data = 1440（12 个数据符号 × 120 子载波，DMRS 符号 2/11 全导频）。
+n_data 随配置变化（如 14 符号 {1+1} × 120 子载波 = 1440；3 符号 {1} × 12 = 24）。
 """
 import os
+import pickle
 
 import numpy as np
-import torch
-from torch.utils.data import Dataset
 
 import config
-from data_gen import qam_constellation, demap_llr
-from tokenizer import data_re_index
 
-DATA_RE_IDX = data_re_index()     # (1440, 2) [sc, symb]
-N_DATA = len(DATA_RE_IDX)
-N_SC_3D = 120
-N_SYMB_3D = 14
-
-
-def pack_samples(samples):
-    """
-    把 Sionna 样本列表打包成 numpy 数组。
-    返回 dict：
-      H_est (n, 8, 120, 14) complex, z (n, 1440) complex,
-      llr (n, 1440, 8), llr_base (n, 1440, 8), bits (n, 1440, 8),
-      mod_oh (n, 4), sigma2 (n,), valid (n, 1440), nbits (n,)
-    llr: 理想信道 max-log 参考 LLR（评估指标用）
-    llr_base: 传统均衡后软解调基线（仅评估对比用；模型输入已不含 llr_base）
-    """
-    n = len(samples)
-    H_est = np.zeros((n, config.N_ANT, N_SC_3D, N_SYMB_3D), dtype=np.complex64)
-    z = np.zeros((n, N_DATA), dtype=np.complex64)
-    llr = np.zeros((n, N_DATA, config.MAX_BITS), dtype=np.float32)
-    llr_base = np.zeros((n, N_DATA, config.MAX_BITS), dtype=np.float32)
-    bits = np.zeros((n, N_DATA, config.MAX_BITS), dtype=np.int8)
-    mod_oh = np.zeros((n, config.MOD_ONHOT_DIM), dtype=np.float32)
-    sigma2 = np.zeros(n, dtype=np.float32)
-    valid = np.ones((n, N_DATA), dtype=np.float32)
-    nbits = np.zeros(n, dtype=np.int32)
-
-    for i, s in enumerate(samples):
-        H_est[i] = s["H_est"]
-        z[i] = s["z"]
-        k = s["llr_ref"].shape[1]
-        llr[i, :, :k] = s["llr_ref"]
-        bits[i, :, :k] = s["bits_tx"]
-        mod = int(s["mod_order"])
-        X, btab = qam_constellation(mod)
-        llr_base[i, :, :k] = demap_llr(s["z"], s["sigma2_eq"], X, btab, config.MAX_LLR)
-        mod_oh[i, config.MOD_ORDERS.index(mod)] = 1.0
-        sigma2[i] = s["sigma2"]
-        nbits[i] = k
-
-    return {
-        "H_est": H_est, "z": z, "llr": llr, "llr_base": llr_base, "bits": bits,
-        "mod_oh": mod_oh, "sigma2": sigma2, "valid": valid, "nbits": nbits,
-    }
-
-
-def pack_pretrain(samples):
-    """预训练只需信道矩阵 -> (n, 8, 120, 14) 复数数组"""
-    n = len(samples)
-    H = np.zeros((n, config.N_ANT, N_SC_3D, N_SYMB_3D), dtype=np.complex64)
-    for i, s in enumerate(samples):
-        H[i] = s["H_est"]
-    return H
-
-
-class LLRDataset(Dataset):
-    """阶段 2 微调数据集"""
-    def __init__(self, packed):
-        self.H_est = torch.tensor(packed["H_est"])
-        self.z = torch.tensor(packed["z"])
-        self.llr = torch.tensor(packed["llr"])
-        self.llr_base = torch.tensor(packed["llr_base"])
-        self.bits = torch.tensor(packed["bits"])
-        self.mod_oh = torch.tensor(packed["mod_oh"])
-        self.sigma2 = torch.tensor(packed["sigma2"])
-        self.valid = torch.tensor(packed["valid"])
-        self.nbits = torch.tensor(packed["nbits"])
-
-    def __len__(self):
-        return self.H_est.shape[0]
-
-    def __getitem__(self, i):
-        return (self.H_est[i], self.z[i], self.llr[i], self.llr_base[i],
-                self.bits[i], self.mod_oh[i], self.sigma2[i],
-                self.valid[i], self.nbits[i])
-
-
-def llr_collate(batch):
-    return tuple(torch.stack([b[j] for b in batch]) for j in range(len(batch[0])))
-
-
-class PretrainDataset(Dataset):
-    """阶段 1 继续预训练数据集（仅信道，3D）"""
-    def __init__(self, H_arr):
-        self.H = torch.tensor(H_arr)
-
-    def __len__(self):
-        return self.H.shape[0]
-
-    def __getitem__(self, i):
-        return self.H[i]
-
-
-# ================= 数据缓存（Sionna 生成一次，训练复用） =================
-
-def save_packed(path, packed):
-    """packed dict of numpy arrays -> npz"""
-    np.savez(path, **packed)
-
-
-def load_packed(path):
-    """npz -> dict of numpy arrays"""
-    with np.load(path, allow_pickle=True) as d:
-        return {k: d[k] for k in d.files}
-
-
-def save_pretrain_cache(path, H_arr):
-    np.savez(path, H_est=H_arr)
-
-
-def load_pretrain_cache(path):
-    with np.load(path) as d:
-        return d["H_est"]
-
-
-# ================= v2 多配置数据集（一个模型适配多种系统参数） =================
 
 def build_cfg_vec(batch):
     """配置元数据向量 (B, CFG_DIM)：接收机已知的系统参数（帮助小数据下区分配置）"""
@@ -152,9 +34,9 @@ def build_cfg_vec(batch):
     return v
 
 
-def collate_v2(batch):
+def collate_batch(batch):
     """
-    合并一批**同 (n_sc, n_symb) 配置**的样本 dict -> 训练 batch dict（numpy）。
+    合并一批**同 (n_sc, n_symb, n_rx, n_data) 配置**的样本 dict -> 训练 batch dict（numpy）。
     比特/LLR 按 MAX_BITS=8 补齐，nbits 记录真实比特数（损失掩码用）。
     """
     B = len(batch)
@@ -198,8 +80,9 @@ def collate_v2(batch):
 
 class BucketedLoader:
     """
-    多配置训练的桶式加载器：按 (n_sc, n_symb) 分组，batch 内同配置
-    （CNN 特征图尺寸一致），epoch 内轮转各组。返回 collate_v2 后的 dict。
+    多配置训练的桶式加载器：按 (n_sc, n_symb, n_rx, n_data) 分组，batch 内同配置
+    （CNN 特征图尺寸一致），epoch 内轮转各组。返回 collate_batch 后的 dict。
+    组内样本不足 batch_size 时有放回采样凑满（训练稳定；验证用无放回）。
     """
 
     def __init__(self, samples, batch_size, shuffle=True, seed=0):
@@ -221,7 +104,6 @@ class BucketedLoader:
             if self.shuffle:
                 self.rng.shuffle(idxs)
             if self.shuffle and len(idxs) < self.batch_size:
-                # 配置组样本不足时：有放回采样凑满 batch（训练稳定；验证用无放回）
                 idxs = [int(i) for i in self.rng.choice(idxs, size=self.batch_size, replace=True)]
                 batches.append((key, idxs))
             else:
@@ -233,7 +115,7 @@ class BucketedLoader:
 
     def __iter__(self):
         for key, idxs in self._make_batches():
-            yield collate_v2([self.samples[i] for i in idxs])
+            yield collate_batch([self.samples[i] for i in idxs])
 
     def __len__(self):
         n = 0
@@ -242,40 +124,40 @@ class BucketedLoader:
         return n
 
 
+# ================= 数据缓存（Sionna 生成一次，训练复用） =================
+
 def save_samples_pkl(path, samples):
-    """样本列表 -> pickle（v2 缓存，样本形状随配置变化，不能用固定 npz）"""
-    import pickle
+    """样本列表 -> pickle（形状随配置变化，不能用固定 npz）"""
     with open(path, "wb") as f:
         pickle.dump(samples, f)
 
 
 def load_samples_pkl(path):
-    import pickle
     with open(path, "rb") as f:
         return pickle.load(f)
 
 
-def build_v2_data(n_train, n_val, n_pt, seed, cache_tr, cache_va, cache_pt,
-                  group_size=None):
+def build_data(n_train, n_val, n_pt, seed, cache_tr, cache_va, cache_pt,
+               group_size=None):
     """
-    生成或加载 v2 多配置数据缓存（train/val/pt，大规模版：每组合 group_size 样本）。
+    生成或加载多配置数据缓存（train/val/pt，大规模版：每组合 group_size 样本）。
     返回 (tr_samples, va_samples, pt_samples)。
     """
-    from data_gen_sionna import generate_dataset_v2
+    from data_gen_sionna import generate_dataset
     if all(os.path.exists(p) for p in (cache_tr, cache_va, cache_pt)):
-        print("[V2] 加载缓存数据")
+        print("[DATA] 加载缓存数据")
         return (load_samples_pkl(cache_tr), load_samples_pkl(cache_va),
                 load_samples_pkl(cache_pt))
     import time
     t0 = time.time()
-    gs = group_size or config.V2_GROUP_SIZE
-    print(f"[V2] 生成多配置数据: train={n_train}, val={n_val}, pt={n_pt} "
+    gs = group_size or config.GROUP_SIZE
+    print(f"[DATA] 生成多配置数据: train={n_train}, val={n_val}, pt={n_pt} "
           f"(seed={seed}, group_size={gs}) ...")
-    tr = generate_dataset_v2(n_train, seed=seed, group_size=gs)
-    va = generate_dataset_v2(n_val, seed=seed + 1000, group_size=gs)
-    pt = generate_dataset_v2(n_pt, seed=seed + 2000, group_size=gs)
+    tr = generate_dataset(n_train, seed=seed, group_size=gs)
+    va = generate_dataset(n_val, seed=seed + 1000, group_size=gs)
+    pt = generate_dataset(n_pt, seed=seed + 2000, group_size=gs)
     save_samples_pkl(cache_tr, tr)
     save_samples_pkl(cache_va, va)
     save_samples_pkl(cache_pt, pt)
-    print(f"[V2] 数据就绪并缓存 ({time.time()-t0:.1f}s)")
+    print(f"[DATA] 数据就绪并缓存 ({time.time()-t0:.1f}s)")
     return tr, va, pt

@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-模型定义（设计文档第 5、6 节，性能优化 + 多配置自适应版）：
+模型定义：
   1. LWM 骨干：与官方 lwm_model.py 结构完全一致（保证可加载官方权重），
      新增 encode() 返回逐 patch 隐状态。
   2. CNNLLRDecoder：CNN 残差网络（参考 NNreceiver 架构）。
      输入 = 全网格特征图 [channel_emb(64) + H_patch(16) + Re(z) + Im(z)
-            + σ² + mod_onehot(4)]（不含 llr_base，免去传统软解调，降低复杂度）
+            + σ² + mod_onehot(4) + 配置元数据 cfg]（不含 llr_base，免传统软解调）
      输出 = 逐数据 RE 的逐比特 LLR logits（正=bit1）。
-  3. LWMLLR：组合模型，输入 (H, z, σ², mod_onehot, data_re_idx) -> (B, T, 8) LLR。
+  3. LWMLLR：组合模型，输入 (H, z, σ², mod_onehot, data_re_idx, cfg) -> (B, T, 8) LLR。
      多配置自适应：接收天线 1/2/4/8（补零到 8）、子载波 1~10 RB（序列长度自适应）、
      符号数 3~14、DMRS {1}/{1+1}/{1+2}（数据 RE 索引随样本传入）。
 """
@@ -261,23 +261,14 @@ class CNNLLRDecoder(nn.Module):
 # ================= 组合模型 =================
 
 from data_gen import qam_constellation
-from tokenizer import data_re_index
-
-# Sionna PUSCH 数据 RE 索引与维度
-DATA_RE_IDX = data_re_index()          # (1440, 2) [sc, symb]
-N_DATA = len(DATA_RE_IDX)
-N_SC_3D = 120
-N_SYMB_3D = 14
-DATA_SC = DATA_RE_IDX[:, 0]
-DATA_SYMB = DATA_RE_IDX[:, 1]
 
 
 class LWMLLR(nn.Module):
-    """LWM 骨干 + CNN LLR decoder（v2 多配置自适应版）。
+    """LWM 骨干 + CNN LLR decoder（多配置自适应版）。
     输入 3D 信道 H (B, n_rx, n_sc, n_symb) -> 数据 RE 的逐比特 LLR。
     适配：n_rx∈{1,2,4,8}（补零到 8）、n_sc∈{12,...,120}（1~10 RB，序列长度自适应）、
     n_symb∈{3,...,14}、DMRS {1}/{1+1}/{1+2}（数据 RE 索引随样本传入）。
-    性能优化：输入不含 llr_base（无需传统软解调），decoder 为 CNN 残差网络。
+    输入不含 llr_base（无需传统软解调），decoder 为 CNN 残差网络。
     """
 
     MAX_RX_ANT = 8   # patch 维度 16 与官方 LWM embedding 对齐，天线不足补零
@@ -364,7 +355,7 @@ class LWMLLR(nn.Module):
 
     def infer_llr(self, H, z, sigma2, mod_order, data_re_idx, cfg):
         """
-        推理入口（v2 多配置）。
+        推理入口（多配置自适应）。
         H: (n_rx, n_sc, n_symb) complex
         z: (n_data,) complex（数据 RE 均衡符号）
         sigma2: float

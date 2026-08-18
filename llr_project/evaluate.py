@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-性能评估（v2 多配置版，Sionna PUSCH 3D 数据）
+性能评估（多配置自适应版，Sionna PUSCH 3D 数据）
 
 评估一个模型在不同系统参数组合下的 LLR 预测性能：
   1. 传统基线  ：max-log LLR 用带噪信道估计 H_est（仅作对比，模型推理不再需要）
@@ -24,7 +24,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from data_gen import qam_constellation, demap_llr
-from data_gen_sionna import SionnaPUSCHSystem, generate_dataset_v2
+from data_gen_sionna import SionnaPUSCHSystem
 from model import LWMLLR, load_official_backbone
 
 import matplotlib
@@ -33,17 +33,11 @@ import matplotlib.pyplot as plt
 
 
 def load_llr_model(ckpt, device="cpu"):
-    """加载阶段2微调权重（兼容旧权重：仅取 backbone 部分）"""
+    """加载阶段2微调权重（完整状态字典）"""
     bb = load_official_backbone(device=device)
     model = LWMLLR(bb).to(device)
     sd = torch.load(ckpt, map_location=device)
-    try:
-        model.load_state_dict(sd)
-    except RuntimeError:
-        bb_sd = {k.replace("backbone.", ""): v for k, v in sd.items()
-                 if k.startswith("backbone.")}
-        bb.load_state_dict(bb_sd)
-        model = LWMLLR(bb).to(device)
+    model.load_state_dict(sd)
     model.eval()
     return model
 
@@ -113,7 +107,7 @@ def eval_sample(sample, model=None, model_nopt=None):
 def eval_cfg(rng, i, snr):
     """确定性配置循环（覆盖各维度）：天线 1/2/4/8 × RB 1~10 × 符号 3~14
     × DMRS 0/1/2 × TDL A/B/C/D × 速度 0/5/30，随样本序号循环偏移"""
-    ants = config.V2_RX_ANTS
+    ants = config.RX_ANTS
     rbs = [1, 2, 3, 4, 6, 8, 10]
     symbs = [3, 5, 7, 10, 14]
     aps = [0, 1, 2]
@@ -125,38 +119,38 @@ def eval_cfg(rng, i, snr):
         "num_ofdm_symbols": symbs[(i + 2) % len(symbs)],
         "dmrs_ap": aps[(i + 3) % len(aps)],
         "channel_model": tdls[(i + 4) % len(tdls)],
-        "delay_spread": config.V2_DELAY_SPREADS[(i + 5) % 3],
+        "delay_spread": config.DELAY_SPREADS[(i + 5) % 3],
         "max_speed": speeds[(i + 6) % len(speeds)],
-        "carrier_frequency": config.V2_CARRIER_FREQUENCY,
+        "carrier_frequency": config.CARRIER_FREQUENCY,
     }
 
 
 def main():
     print("=" * 80)
-    print("LWM LLR 预测性能评估（v2 多配置：天线/RB/符号/DMRS/信道场景）")
+    print("LWM LLR 预测性能评估（多配置：天线/RB/符号/DMRS/信道场景）")
     print("=" * 80)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = None
     model_nopt = None
-    if os.path.exists(config.CKPT_LLR_V2):
-        print(f"加载主模型: {config.CKPT_LLR_V2}")
-        model = load_llr_model(config.CKPT_LLR_V2, device)
+    if os.path.exists(config.CKPT_LLR):
+        print(f"加载主模型: {config.CKPT_LLR}")
+        model = load_llr_model(config.CKPT_LLR, device)
     else:
-        print("警告: 未找到 lwm_llr_v2.pt，仅评估基线")
-    if os.path.exists(config.CKPT_LLR_NO_PT_V2):
-        print(f"加载对照模型: {config.CKPT_LLR_NO_PT_V2}")
-        model_nopt = load_llr_model(config.CKPT_LLR_NO_PT_V2, device)
+        print("警告: 未找到 lwm_llr.pt，仅评估基线")
+    if os.path.exists(config.CKPT_LLR_NO_PT):
+        print(f"加载对照模型: {config.CKPT_LLR_NO_PT}")
+        model_nopt = load_llr_model(config.CKPT_LLR_NO_PT, device)
 
-    rng = np.random.default_rng(config.V2_EVAL_SEED)
+    rng = np.random.default_rng(config.EVAL_SEED)
     results = []
     t0 = time.time()
-    for snr in config.V2_EVAL_SNR_LIST:
-        for i in range(config.V2_EVAL_PER_SNR):
+    for snr in config.EVAL_SNR_LIST:
+        for i in range(config.EVAL_PER_SNR):
             cfg = eval_cfg(rng, i, snr)
             sys_ = SionnaPUSCHSystem(**cfg)
             mod = [4, 16, 64, 256][(i + snr) % 4]
-            batch = sys_.generate_batch(1, snr, mod, seed=config.V2_EVAL_SEED + snr + i)
+            batch = sys_.generate_batch(1, snr, mod, seed=config.EVAL_SEED + snr + i)
             s = {k: (v[0] if isinstance(v, np.ndarray) and v.ndim > 0 and k != "data_re_idx"
                      else v) for k, v in batch.items()}
             s["snr_db"] = float(snr)
@@ -174,7 +168,7 @@ def main():
     print(hdr)
     print("-" * 100)
     xs, ys_base, ys_lwm = [], [], []
-    for snr in config.V2_EVAL_SNR_LIST:
+    for snr in config.EVAL_SNR_LIST:
         rs = [r for r in results if abs(r["snr_db"] - snr) < 1e-6]
         if not rs:
             continue
@@ -229,20 +223,20 @@ def main():
     if model is not None and xs:
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.semilogy(xs, np.clip(ys_base, 1e-6, 1), "r--s", label="Baseline (H_est)")
-        ax.semilogy(xs, np.clip(ys_lwm, 1e-6, 1), "b-^", label="LWM+CNN (v2 multi-config)")
+        ax.semilogy(xs, np.clip(ys_lwm, 1e-6, 1), "b-^", label="LWM+CNN (multi-config)")
         ax.set_xlabel("SNR (dB)")
         ax.set_ylabel("BER")
         ax.set_title("LWM LLR Prediction: BER vs SNR (multi-config PUSCH)")
         ax.grid(True, which="both", alpha=0.3)
         ax.legend()
         plt.tight_layout()
-        png = os.path.join(config.BASE_DIR, "eval_ber_curves_v2.png")
+        png = os.path.join(config.BASE_DIR, "eval_ber_curves.png")
         plt.savefig(png, dpi=130)
         print(f"\n图已保存: {png}")
 
-    with open(os.path.join(config.BASE_DIR, "eval_results_v2.json"), "w") as f:
+    with open(os.path.join(config.BASE_DIR, "eval_results.json"), "w") as f:
         json.dump({"results": results}, f, indent=2)
-    print("结果已保存: eval_results_v2.json")
+    print("结果已保存: eval_results.json")
 
 
 if __name__ == "__main__":

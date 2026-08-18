@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Sionna 数据生成器（3GPP 5G NR PUSCH 标准实现，v2 多配置版）
+Sionna 数据生成器（3GPP 5G NR PUSCH 标准实现，多配置自适应版）
 
 基于 Sionna 2.x（PyTorch 后端）的链路级仿真，支持一个模型适配多种系统参数：
   1. 标准 PUSCH 发射机（sionna.phy.nr.PUSCHTransmitter）
@@ -32,37 +32,13 @@ from sionna.phy.channel.tr38901 import TDL
 from sionna.phy.channel import TimeChannel, time_to_ofdm_channel
 
 import config
-
-
-def qam_constellation(m):
-    """Gray 映射 QAM 星座（能量归一化），与 data_gen.py 一致"""
-    def _ungray(n):
-        x = n
-        while n >> 1:
-            n >>= 1
-            x ^= n
-        return x
-    k = int(np.log2(m))
-    side = int(np.sqrt(m))
-    hk = k // 2
-    X = np.zeros(m, dtype=np.complex128)
-    bits = np.zeros((m, k), dtype=np.int8)
-    for s in range(m):
-        i_idx = s >> hk
-        q_idx = s & (side - 1)
-        i = _ungray(i_idx)
-        q = _ungray(q_idx)
-        X[s] = (2 * i - side + 1) + 1j * (2 * q - side + 1)
-        for b in range(k):
-            bits[s, k - 1 - b] = (s >> b) & 1
-    X /= np.sqrt(np.mean(np.abs(X) ** 2))
-    return X, bits
+from data_gen import qam_constellation
 
 
 class SionnaPUSCHSystem:
     """
     封装完整的 Sionna PUSCH 链路（一个配置实例，可批量生成样本）。
-    v2：配置可任意组合 num_rx_ant / RB / 符号数 / DMRS 模式 / 信道场景。
+    配置可任意组合 num_rx_ant / RB / 符号数 / DMRS 模式 / 信道场景。
     """
 
     def __init__(self, num_rx_ant=8, n_size_grid=10, num_ofdm_symbols=14,
@@ -313,24 +289,24 @@ class SionnaPUSCHSystem:
 def sample_config(rng, rx_ants=None, rb_range=None, symb_range=None,
                   dmrs_aps=None, tdl_models=None, delay_spreads=None,
                   max_speeds=None):
-    """随机采样一个系统配置 dict（v2 多配置空间）"""
+    """随机采样一个系统配置 dict（多配置空间）"""
     import config
     return {
-        "num_rx_ant": int(rng.choice(rx_ants or config.V2_RX_ANTS)),
-        "n_size_grid": int(rng.integers(*(rb_range or config.V2_RB_RANGE))),
-        "num_ofdm_symbols": int(rng.integers(*(symb_range or config.V2_SYMB_RANGE))),
-        "dmrs_ap": int(rng.choice(dmrs_aps or config.V2_DMRS_APS)),
-        "channel_model": str(rng.choice(tdl_models or config.V2_TDL_MODELS)),
-        "delay_spread": float(rng.choice(delay_spreads or config.V2_DELAY_SPREADS)),
-        "max_speed": float(rng.choice(max_speeds or config.V2_MAX_SPEEDS)),
-        "carrier_frequency": config.V2_CARRIER_FREQUENCY,
+        "num_rx_ant": int(rng.choice(rx_ants or config.RX_ANTS)),
+        "n_size_grid": int(rng.integers(*(rb_range or config.RB_RANGE))),
+        "num_ofdm_symbols": int(rng.integers(*(symb_range or config.SYMB_RANGE))),
+        "dmrs_ap": int(rng.choice(dmrs_aps or config.DMRS_APS)),
+        "channel_model": str(rng.choice(tdl_models or config.TDL_MODELS)),
+        "delay_spread": float(rng.choice(delay_spreads or config.DELAY_SPREADS)),
+        "max_speed": float(rng.choice(max_speeds or config.MAX_SPEEDS)),
+        "carrier_frequency": config.CARRIER_FREQUENCY,
     }
 
 
-def generate_dataset_v2(n_samples, seed=0, snr_db=None, batch_size=32,
-                        cfg_sampler=None, group_size=1):
+def generate_dataset(n_samples, seed=0, snr_db=None, batch_size=32,
+                     cfg_sampler=None, group_size=1):
     """
-    v2：多配置混合样本生成（大规模版）。
+    多配置混合样本生成（大规模版）。
     先采样 n_combos = ceil(n_samples/group_size) 个系统配置，每个配置组合生成
     group_size 个**不同**样本（不同信道实现/噪声/比特），同配置样本一组生成
     （组件复用）。SNR/调制逐组随机（snr_db 给定时固定 SNR）。
@@ -363,33 +339,6 @@ def generate_dataset_v2(n_samples, seed=0, snr_db=None, batch_size=32,
             d["cfg"] = dict(cfg)
             samples[idx] = d
             idx += 1
-    return samples
-
-
-def generate_dataset(n_samples, num_rx_ant=8, n_size_grid=10, mod_orders=None,
-                     snr_db=None, seed=0, batch_size=32):
-    """
-    固定配置批量生成样本（列表，v1 兼容）。SNR/调制随机采样。
-    """
-    rng = np.random.default_rng(seed)
-    if mod_orders is None:
-        mod_orders = [4, 16, 64, 256]
-    sys = SionnaPUSCHSystem(num_rx_ant=num_rx_ant, n_size_grid=n_size_grid)
-    samples = []
-    n_batches = int(np.ceil(n_samples / batch_size))
-    for bi in range(n_batches):
-        bs = min(batch_size, n_samples - bi * batch_size)
-        if bs <= 0:
-            break
-        mod = int(mod_orders[rng.integers(0, len(mod_orders))])
-        if snr_db is None:
-            s = float(rng.uniform(-5, 25))
-        else:
-            s = float(snr_db)
-        batch = sys.generate_batch(bs, s, mod, seed=seed + bi)
-        for i in range(bs):
-            samples.append({k: v[i] if isinstance(v, np.ndarray) and v.ndim > 0
-                            else v for k, v in batch.items()})
     return samples
 
 

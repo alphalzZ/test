@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-阶段 1：MCM 继续预训练（v2 多配置版，GPU 加速）
+阶段 1：MCM 继续预训练（多配置版，GPU 加速）
 逐 OFDM 符号独立做 MCM：mask 15% 的子载波 patch 并重建。
-v2：训练数据为多配置混合（天线 1/2/4/8 × RB 1~10 × 符号 3~14 × DMRS 3 模式
-× TDL-A/B/C/D × 时延/多普勒），按 n_sc 分桶保证 batch 内序列等长。
+训练数据为多配置混合（天线 1/2/4/8 × RB 1~10 × 符号 3~14 × DMRS 3 模式
+× TDL-A/B/C/D × 时延/多普勒），按 (n_sc, n_rx, n_symb) 分桶保证 batch 内等形。
 
-- GPU 可用时自动使用 CUDA（6GB 显存限制下用 batch 16 + 梯度累积）
+- GPU 可用时自动使用 CUDA（6GB 显存限制下用 batch 8 + 梯度累积）
 - Sionna 数据生成一次并缓存到 data/，后续训练直接加载
 
-用法：python train_pretrain.py [--epochs 10] [--samples 500]
+用法：python train_pretrain.py [--epochs 15] [--samples 2000]
 """
 import argparse
 import os
@@ -21,7 +21,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from dataset import build_v2_data
+from dataset import build_data
 from model import load_official_backbone, LWMLLR
 
 
@@ -59,11 +59,11 @@ def train(args):
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     print(f"[PT] device={device}")
 
-    _, _, pt = build_v2_data(args.samples, args.val_n, args.samples,
+    _, _, pt = build_data(args.samples, args.val_n, args.samples,
                              seed=args.seed,
-                             cache_tr=config.CACHE_V2_TRAIN,
-                             cache_va=config.CACHE_V2_VAL,
-                             cache_pt=config.CACHE_V2_PT)
+                             cache_tr=config.CACHE_TRAIN,
+                             cache_va=config.CACHE_VAL,
+                             cache_pt=config.CACHE_PT)
     batches = make_pt_batches(pt, batch_size=args.batch, seed=args.seed)
     n_scs = sorted({int(s["H_est"].shape[1]) for s in pt})
     print(f"[PT] 预训练样本 {len(pt)}，子载波配置 {n_scs} 种，batch {args.batch}")
@@ -115,17 +115,17 @@ def train(args):
         avg = running / max(n_iter, 1)
         print(f"[PT] epoch {epoch}/{args.epochs}  loss={avg:.5f}  ({time.time()-t0:.1f}s)")
 
-    torch.save(backbone.state_dict(), config.CKPT_PRETRAIN_V2)
-    print(f"[PT] 保存继续预训练权重 -> {config.CKPT_PRETRAIN_V2}")
+    torch.save(backbone.state_dict(), config.CKPT_PRETRAIN)
+    print(f"[PT] 保存继续预训练权重 -> {config.CKPT_PRETRAIN}")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=config.V2_PT_EPOCHS)
-    p.add_argument("--samples", type=int, default=config.V2_PT_N)
-    p.add_argument("--val-n", type=int, default=config.V2_VAL_N)
-    p.add_argument("--batch", type=int, default=config.V2_BATCH)
-    p.add_argument("--grad-accum", type=int, default=config.V2_GRAD_ACCUM)
+    p.add_argument("--epochs", type=int, default=config.PT_EPOCHS)
+    p.add_argument("--samples", type=int, default=config.PT_N)
+    p.add_argument("--val-n", type=int, default=config.VAL_N)
+    p.add_argument("--batch", type=int, default=config.BATCH)
+    p.add_argument("--grad-accum", type=int, default=config.GRAD_ACCUM)
     p.add_argument("--lr", type=float, default=config.PT_LR)
-    p.add_argument("--seed", type=int, default=config.V2_SEED)
+    p.add_argument("--seed", type=int, default=config.SEED)
     train(p.parse_args())

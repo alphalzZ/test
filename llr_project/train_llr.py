@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-阶段 2：LLR 微调（v2 多配置版，GPU 加速）
+阶段 2：LLR 微调（多配置版，GPU 加速）
 在 LWM（继续预训练或官方权重）之上训练 CNN LLR decoder。
 监督标签：真实传输的 0/1 bit（bits_tx），损失函数：BCE（binary cross-entropy）。
 模型输入不含 llr_base（无需传统软解调），decoder 为 CNN 残差网络（NNreceiver 风格）。
 
-v2 多配置：一个模型适配 天线 1/2/4/8 × RB 1~10 × 符号 3~14 × DMRS {1}/{1+1}/{1+2}
-× TDL-A/B/C/D × 时延/多普勒，训练数据为各种配置的混合（小数据量验证）。
-训练时按 (n_sc, n_symb) 分桶（batch 内同配置，CNN 特征图尺寸一致）。
+多配置：一个模型适配 天线 1/2/4/8 × RB 1~10 × 符号 3~14 × DMRS {1}/{1+1}/{1+2}
+× TDL-A/B/C/D × 时延/多普勒，训练数据为各种配置的混合（每配置组合多样本）。
+训练时按 (n_sc, n_symb, n_rx, n_data) 分桶（batch 内同配置，CNN 特征图尺寸一致）。
 
 用法：
   python train_llr.py                       # 用阶段1权重微调（主模型）
@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from dataset import (BucketedLoader, build_v2_data,
+from dataset import (BucketedLoader, build_data,
                      load_samples_pkl, save_samples_pkl)
 from model import LWMLLR, load_official_backbone
 
@@ -53,7 +53,7 @@ def val_ber(pred, bits, valid, nbits):
 
 
 def to_tensors(b, device):
-    """collate_v2 的 numpy dict -> GPU tensors（data_re_idx 保留 numpy）"""
+    """collate_batch 的 numpy dict -> GPU tensors（data_re_idx 保留 numpy）"""
     return {
         "H_est": torch.tensor(b["H_est"], device=device),
         "z": torch.tensor(b["z"], device=device),
@@ -75,11 +75,11 @@ def train(args):
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     print(f"[FT] device={device}")
 
-    tr, va, _ = build_v2_data(args.train_n, args.val_n, args.pt_n,
+    tr, va, _ = build_data(args.train_n, args.val_n, args.pt_n,
                               seed=args.seed,
-                              cache_tr=config.CACHE_V2_TRAIN,
-                              cache_va=config.CACHE_V2_VAL,
-                              cache_pt=config.CACHE_V2_PT)
+                              cache_tr=config.CACHE_TRAIN,
+                              cache_va=config.CACHE_VAL,
+                              cache_pt=config.CACHE_PT)
     tr_loader = BucketedLoader(tr, batch_size=args.batch, shuffle=True, seed=args.seed)
     va_loader = BucketedLoader(va, batch_size=args.batch, shuffle=False, seed=0)
     print(f"[FT] 训练样本 {len(tr)}（{tr_loader.n_groups} 种 (n_sc,n_symb) 配置），"
@@ -88,15 +88,15 @@ def train(args):
     # 骨干初始化
     if args.no_pretrain:
         backbone = load_official_backbone(device=device)
-        ckpt_out = config.CKPT_LLR_NO_PT_V2
+        ckpt_out = config.CKPT_LLR_NO_PT
         print("[FT] 对照模式：使用官方权重（无继续预训练）")
     else:
-        if not os.path.exists(config.CKPT_PRETRAIN_V2):
-            raise FileNotFoundError(f"未找到继续预训练权重 {config.CKPT_PRETRAIN_V2}，请先运行 train_pretrain.py")
+        if not os.path.exists(config.CKPT_PRETRAIN):
+            raise FileNotFoundError(f"未找到继续预训练权重 {config.CKPT_PRETRAIN}，请先运行 train_pretrain.py")
         bb = load_official_backbone(device=device)
-        bb.load_state_dict(torch.load(config.CKPT_PRETRAIN_V2, map_location=device))
+        bb.load_state_dict(torch.load(config.CKPT_PRETRAIN, map_location=device))
         backbone = bb
-        ckpt_out = config.CKPT_LLR_V2
+        ckpt_out = config.CKPT_LLR
         print("[FT] 主模式：加载继续预训练权重")
 
     model = LWMLLR(backbone, freeze_backbone=args.freeze_backbone).to(device)
@@ -162,15 +162,15 @@ def train(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--train-n", type=int, default=config.V2_TRAIN_N)
-    p.add_argument("--val-n", type=int, default=config.V2_VAL_N)
-    p.add_argument("--pt-n", type=int, default=config.V2_PT_N)
-    p.add_argument("--epochs", type=int, default=config.V2_FT_EPOCHS)
-    p.add_argument("--batch", type=int, default=config.V2_BATCH)
-    p.add_argument("--grad-accum", type=int, default=config.V2_GRAD_ACCUM)
-    p.add_argument("--lr", type=float, default=config.V2_LR)
-    p.add_argument("--lr-backbone", type=float, default=config.V2_LR_BACKBONE)
-    p.add_argument("--seed", type=int, default=config.V2_SEED)
+    p.add_argument("--train-n", type=int, default=config.TRAIN_N)
+    p.add_argument("--val-n", type=int, default=config.VAL_N)
+    p.add_argument("--pt-n", type=int, default=config.PT_N)
+    p.add_argument("--epochs", type=int, default=config.FT_EPOCHS)
+    p.add_argument("--batch", type=int, default=config.BATCH)
+    p.add_argument("--grad-accum", type=int, default=config.GRAD_ACCUM)
+    p.add_argument("--lr", type=float, default=config.LR)
+    p.add_argument("--lr-backbone", type=float, default=config.LR_BACKBONE)
+    p.add_argument("--seed", type=int, default=config.SEED)
     p.add_argument("--no-pretrain", action="store_true", help="对照：官方权重直接微调")
     p.add_argument("--freeze-backbone", action="store_true", help="冻结骨干只训 decoder")
     train(p.parse_args())
