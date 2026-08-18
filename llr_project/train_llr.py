@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-阶段 2：LLR 微调（设计文档第 6、7 节，GPU 加速）
-在 LWM（继续预训练或官方权重）之上训练 LLR decoder，监督标签为 max-log 参考 LLR。
+阶段 2：LLR 微调（设计文档第 6、7 节，GPU 加速，性能优化版）
+在 LWM（继续预训练或官方权重）之上训练 CNN LLR decoder。
+监督标签：真实传输的 0/1 bit（bits_tx），损失函数：BCE（binary cross-entropy）。
+模型输入不含 llr_base（无需传统软解调），decoder 为 CNN 残差网络（NNreceiver 风格）。
 
 - GPU 可用时自动使用 CUDA（batch 16 + 梯度累积等效 64）
 - Sionna 数据生成一次缓存到 data/，训练直接加载
@@ -18,6 +20,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -44,6 +47,27 @@ def build_ft_data(n_train, n_val, seed, cache_tr, cache_va):
     save_packed(cache_va, va_p)
     print(f"[FT] 数据就绪并缓存 ({time.time()-t0:.1f}s)")
     return tr_p, va_p
+
+
+def bit_mask_like(nbits, shape, device):
+    """有效比特掩码 (B, T, K)：仅 log2M 以内的比特参与计算"""
+    B, T, K = shape
+    return (torch.arange(K, device=device)[None, None, :] <
+            nbits[:, None, None]).float()
+
+
+def bce_loss(pred, bits, valid, nbits):
+    """有效 RE × 有效比特上的 BCE（标签为真实 0/1 bit）"""
+    mask = valid.unsqueeze(-1) * bit_mask_like(nbits, pred.shape, pred.device)
+    loss = F.binary_cross_entropy_with_logits(pred, bits.float(), reduction="none")
+    return (loss * mask).sum() / (mask.sum() + 1e-6)
+
+
+def val_ber(pred, bits, valid, nbits):
+    """硬判决 BER（LLR>0 -> bit1）"""
+    mask = valid.unsqueeze(-1) * bit_mask_like(nbits, pred.shape, pred.device)
+    hard = (pred > 0).float()
+    return ((hard == bits.float()).float() * mask).sum() / (mask.sum() + 1e-6)
 
 
 def train(args):
@@ -91,17 +115,6 @@ def train(args):
             {"params": model.backbone.parameters(), "lr": args.lr_backbone},
         ]
     optimizer = torch.optim.AdamW(params, weight_decay=1e-5)
-    criterion = nn.MSELoss(reduction="none")
-
-    def loss_fn(pred, llr, valid, nbits):
-        """有效 RE × 有效比特掩码上的归一化 MSE（LLR 归一到 [-1,1]）"""
-        B, T, K = pred.shape
-        bit_mask = (torch.arange(K, device=pred.device)[None, None, :] <
-                    nbits[:, None, None]).float()
-        mask = valid.unsqueeze(-1) * bit_mask          # (B, T, K)
-        scale = config.MAX_LLR
-        loss = (criterion(pred / scale, llr / scale) * mask).sum() / (mask.sum() + 1e-6)
-        return loss
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
@@ -110,11 +123,11 @@ def train(args):
         run = 0.0
         optimizer.zero_grad()
         for bi, (H, z, llr, llr_base, bits, mo, s2, valid, nbits) in enumerate(tr_loader):
-            H, z, llr, llr_base, mo, s2, valid, nbits = (
-                H.to(device), z.to(device), llr.to(device), llr_base.to(device),
-                mo.to(device), s2.to(device), valid.to(device), nbits.to(device))
-            pred = model(H, z, s2, mo, llr_base)
-            loss = loss_fn(pred, llr, valid, nbits) / args.grad_accum
+            H, z, mo, s2, bits, valid, nbits = (
+                H.to(device), z.to(device), mo.to(device), s2.to(device),
+                bits.to(device), valid.to(device), nbits.to(device))
+            pred = model(H, z, s2, mo)                       # (B, 1440, 8) logits
+            loss = bce_loss(pred, bits, valid, nbits) / args.grad_accum
             loss.backward()
             if (bi + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -125,20 +138,24 @@ def train(args):
         # 验证
         model.eval()
         vrun = 0.0
+        vber = 0.0
         with torch.no_grad():
             for H, z, llr, llr_base, bits, mo, s2, valid, nbits in va_loader:
-                H, z, llr, llr_base, mo, s2, valid, nbits = (
-                    H.to(device), z.to(device), llr.to(device), llr_base.to(device),
-                    mo.to(device), s2.to(device), valid.to(device), nbits.to(device))
-                pred = model(H, z, s2, mo, llr_base)
-                vrun += loss_fn(pred, llr, valid, nbits).item()
+                H, z, mo, s2, bits, valid, nbits = (
+                    H.to(device), z.to(device), mo.to(device), s2.to(device),
+                    bits.to(device), valid.to(device), nbits.to(device))
+                pred = model(H, z, s2, mo)
+                vrun += bce_loss(pred, bits, valid, nbits).item()
+                vber += val_ber(pred, bits, valid, nbits).item()
         tl = run / len(tr_loader)
         vl = vrun / len(va_loader)
-        print(f"[FT] epoch {epoch}/{args.epochs}  train={tl:.5f}  val={vl:.5f}  ({time.time()-t0:.1f}s)")
+        vb = vber / len(va_loader)
+        print(f"[FT] epoch {epoch}/{args.epochs}  train={tl:.5f}  val={vl:.5f}  "
+              f"valBER={vb:.4f}  ({time.time()-t0:.1f}s)")
         if vl < best_val:
             best_val = vl
             torch.save(model.state_dict(), ckpt_out)
-            print(f"      -> saved {ckpt_out} (val {vl:.5f})")
+            print(f"      -> saved {ckpt_out} (val {vl:.5f}, BER {vb:.4f})")
 
     print(f"[FT] 完成，最佳 val loss={best_val:.5f}，权重 -> {ckpt_out}")
 

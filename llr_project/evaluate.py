@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-性能评估（Sionna PUSCH 3D 数据）
+性能评估（Sionna PUSCH 3D 数据，性能优化版）
 
 对比各方案在数据 RE 上的 LLR：
-  1. 传统基线  ：max-log LLR 用带噪信道估计 H_est
-  2. LWM+Decoder：本项目（继续预训练 + LLR 微调）
-  3. 对照模型  ：LWM（官方权重）+ decoder
-  4. 理想上界  ：max-log LLR 用真实信道 H_true
+  1. 传统基线  ：max-log LLR 用带噪信道估计 H_est（仅作对比，模型推理不再需要）
+  2. LWM+CNN   ：本项目（继续预训练 + LLR 微调，BCE 训练，输入不含 llr_base）
+  3. 对照模型  ：LWM（官方权重）+ CNN decoder
+  4. 理想上界  ：max-log LLR 用真实信道 H_true（标签）
 
 指标：LLR MSE、硬判决 BER；按 SNR / 调制阶数分档。
 用法：python evaluate.py
@@ -31,14 +31,17 @@ import matplotlib.pyplot as plt
 
 
 def load_llr_model(ckpt, device="cpu"):
-    """加载阶段2微调权重"""
+    """加载阶段2微调权重（新: CNN decoder；兼容旧: 纯 backbone / 旧 MLP decoder 取 backbone 部分）"""
     bb = load_official_backbone(device=device)
     model = LWMLLR(bb).to(device)
     sd = torch.load(ckpt, map_location=device)
     try:
         model.load_state_dict(sd)
     except RuntimeError:
-        bb.load_state_dict(sd)
+        # 兼容旧权重：仅取 backbone 部分（decoder 结构已变更）
+        bb_sd = {k.replace("backbone.", ""): v for k, v in sd.items()
+                 if k.startswith("backbone.")}
+        bb.load_state_dict(bb_sd)
         model = LWMLLR(bb).to(device)
     model.eval()
     return model
@@ -67,14 +70,12 @@ def eval_sample(sample, model=None, model_nopt=None):
     out["ber_base"] = float(np.mean(hard != bits))
 
     if model is not None:
-        llr_lwm = model.infer_llr(H_est, sample["z"], sigma2, mod_order,
-                                  sample["sigma2_eq"])
+        llr_lwm = model.infer_llr(H_est, sample["z"], sigma2, mod_order)
         out["mse_lwm"] = float(np.mean((llr_lwm - llr_ref) ** 2))
         hard = (llr_lwm > 0).astype(int)
         out["ber_lwm"] = float(np.mean(hard != bits))
     if model_nopt is not None:
-        llr_np = model_nopt.infer_llr(H_est, sample["z"], sigma2, mod_order,
-                                      sample["sigma2_eq"])
+        llr_np = model_nopt.infer_llr(H_est, sample["z"], sigma2, mod_order)
         out["mse_lwm_nopt"] = float(np.mean((llr_np - llr_ref) ** 2))
         hard = (llr_np > 0).astype(int)
         out["ber_lwm_nopt"] = float(np.mean(hard != bits))

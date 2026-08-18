@@ -37,6 +37,11 @@ CKPT_PRETRAIN = os.path.join(WEIGHTS_DIR, "lwm_continued.pt")   # 阶段1: MCM �
 CKPT_LLR = os.path.join(WEIGHTS_DIR, "lwm_llr.pt")              # 阶段2: LLR 微调
 CKPT_LLR_NO_PT = os.path.join(WEIGHTS_DIR, "lwm_llr_no_pretrain.pt")  # 对照: 无继续预训练
 
+# ================= CNN LLR Decoder（参考 NNreceiver） =================
+CNN_SEP_CONV = True      # 残差块使用深度可分离卷积（depthwise 3x3 + pointwise 1x1）
+CNN_TRANSPOSE = True     # 首层用转置卷积（Conv2DTranspose 风格，padding 保持网格尺寸）
+CNN_GROUP_NORM = True    # 残差块内使用 GroupNorm
+
 # ================= 训练超参数（GPU 大规模版） =================
 # 阶段 1: MCM 继续预训练
 PT_N_SAMPLES = 3000        # 预训练样本数（每样本 14 符号 = 14 个 MCM 序列）

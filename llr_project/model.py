@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-模型定义（设计文档第 5、6 节）：
+模型定义（设计文档第 5、6 节，性能优化版）：
   1. LWM 骨干：与官方 lwm_model.py 结构完全一致（保证可加载官方权重），
      新增 encode() 返回逐 patch 隐状态。
-  2. LLRDecoder：逐子载波 MLP（方案 A）。
-     输入 [channel_emb(64) + Re(z) + Im(z) + σ² + mod_onehot(4)] -> 输出 log2M 个 LLR
+  2. CNNLLRDecoder：CNN 残差网络（参考 NNreceiver 架构）。
+     输入 = 全网格特征图 [channel_emb(64) + H_patch(16) + Re(z) + Im(z)
+            + σ² + mod_onehot(4)]（不含 llr_base，免去传统软解调，降低复杂度）
+     输出 = 逐数据 RE 的逐比特 LLR logits（正=bit1）。
   3. LWMLLR：组合模型，输入 (H, z, σ², mod_onehot) -> (B, T, 8) LLR
 """
 import os
@@ -154,50 +156,107 @@ class lwm(nn.Module):
         return logits_lm, output
 
 
-# ================= LLR Decoder（残差学习：修正传统 demapper 输出） =================
+# ================= LLR Decoder（CNN 残差网络，参考 NNreceiver） =================
+# 优化点：不再输入 llr_base（传统 max-log 软解调结果），直接由 CNN 在
+# (符号 × 子载波) 全网格上预测逐比特 LLR logits，降低推理复杂度。
 
-class LLRDecoder(nn.Module):
+FEAT_CH = 88   # 特征通道数：64(emb)+16(H patch)+2(Re/Im z)+1(σ²)+4(mod_oh)=87，补零到 88 满足 GroupNorm(groups=2)
+
+
+class CNNResidualBlock(nn.Module):
     """
-    输入 (B, T, 64) channel_emb + (B, T, 16) H_est_patch + (B, T) complex z
-        + (B,) σ² + (B, 4) mod_oh + (B, T, 8) llr_base
-    -> (B, T, 8) Δ（对传统软解调基线 LLR 的修正量）
-    最终 LLR = llr_base + Δ。模型至少达到传统基线水平，学习"信道先验增强"。
+    残差块（NNreceiver residualBlock 风格）：
+      GroupNorm(2) -> 3x3 空洞卷积 -> ReLU -> GroupNorm(2) -> 3x3 空洞卷积 -> + 捷径
+    sep_conv=True 时卷积替换为深度可分离（depthwise 3x3 空洞 + pointwise 1x1）。
+    通道变化时捷径为 1x1 卷积，否则恒等。
     """
 
-    def __init__(self, d_emb=64, d_patch=ELEMENT_LENGTH, hidden=128,
-                 out_bits=config.MAX_BITS, mod_onhot_dim=config.MOD_ONHOT_DIM):
+    def __init__(self, in_channels, out_channels, dilation, group_norm=True, sep_conv=True):
         super().__init__()
-        in_dim = d_emb + d_patch + 2 + 1 + mod_onhot_dim + out_bits   # 64+16+2+1+4+8=95
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.GELU(),
-            nn.Linear(hidden, 64), nn.GELU(),
-            nn.Linear(64, out_bits),
-        )
-        self.max_llr = config.MAX_LLR
+        self.group_norm = group_norm
+        self.dilation = tuple(dilation)
+        if group_norm:
+            self.gn1 = nn.GroupNorm(2, in_channels)
+            self.gn2 = nn.GroupNorm(2, out_channels)
+        if sep_conv:
+            self.conv1 = nn.Sequential(
+                nn.Conv2d(in_channels, in_channels, 3, padding=self.dilation,
+                          dilation=self.dilation, groups=in_channels),
+                nn.Conv2d(in_channels, out_channels, 1),
+            )
+            self.conv2 = nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, 3, padding=self.dilation,
+                          dilation=self.dilation, groups=out_channels),
+                nn.Conv2d(out_channels, out_channels, 1),
+            )
+        else:
+            self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=self.dilation,
+                                   dilation=self.dilation)
+            self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=self.dilation,
+                                   dilation=self.dilation)
+        self.act = nn.ReLU(inplace=True)
+        self.shortcut = (nn.Conv2d(in_channels, out_channels, 1)
+                         if in_channels != out_channels else nn.Identity())
 
-    def forward(self, h_emb, h_patch, z, sigma2, mod_oh, llr_base):
-        """
-        h_emb  : (B, T, 64)
-        h_patch: (B, T, 16)
-        z      : (B, T) complex
-        sigma2 : (B,) or (B,1)
-        mod_oh : (B, mod_dim)
-        llr_base: (B, T, out_bits)
-        -> (B, T, out_bits) 修正后的 LLR = llr_base + Δ
-        """
-        z_re = z.real.unsqueeze(-1)      # (B, T, 1)
-        z_im = z.imag.unsqueeze(-1)
-        s2 = sigma2.reshape(-1, 1, 1).expand(-1, z_re.shape[1], 1)
-        m = mod_oh.unsqueeze(1).expand(-1, z_re.shape[1], -1)
-        x = torch.cat([h_emb, h_patch, z_re, z_im, s2, m, llr_base], dim=-1)  # (B, T, 95)
-        delta = torch.tanh(self.mlp(x)) * self.max_llr
-        llr = torch.clamp(llr_base + delta, -self.max_llr, self.max_llr)
-        return llr
+    def forward(self, x):
+        residual = self.shortcut(x)
+        z = self.gn1(x) if self.group_norm else x
+        z = self.act(self.conv1(z))
+        z = self.gn2(z) if self.group_norm else z
+        z = self.conv2(z)
+        return residual + z
+
+
+class CNNLLRDecoder(nn.Module):
+    """
+    CNN 残差 LLR 解码器（NNreceiver 架构移植）：
+      init_norm: GroupNorm(groups=2)
+      conv1    : 3x3 转置卷积 stride=1（padding=1 保持网格尺寸）-> 64 通道
+      11 个残差块: out_channels=[64,64,128,128,256,256,256,128,128,64,64]
+                   dilation=[(1,1),(1,1),(2,3),(2,3),(2,3),(3,6),(2,3),(2,3),(2,3),(1,1),(1,1)]
+      outconv  : 3x3 卷积 -> num_bits_per_symbol（最大 8 bit，256QAM）
+    输入 (B, C, n_symb, n_sc) -> 输出 (B, n_bits, n_symb, n_sc) LLR logits。
+    """
+
+    def __init__(self, in_channels=FEAT_CH, num_bits_per_symbol=config.MAX_BITS,
+                 group_norm=config.CNN_GROUP_NORM, sep_conv=config.CNN_SEP_CONV,
+                 transpose=config.CNN_TRANSPOSE):
+        super().__init__()
+        self.num_bits_per_symbol = num_bits_per_symbol
+        self.num_res_blok = 11
+        self.dilation = [(1, 1), (1, 1), (2, 3), (2, 3), (2, 3),
+                         (3, 6), (2, 3), (2, 3), (2, 3), (1, 1), (1, 1)]
+        self.out_channels = [64, 64, 128, 128, 256, 256, 256, 128, 128, 64, 64]
+        self.transpose = transpose
+        self.init_norm = nn.GroupNorm(2, in_channels)
+        if transpose:
+            self.conv1 = nn.ConvTranspose2d(in_channels, 64, kernel_size=3,
+                                            stride=1, padding=1)
+        else:
+            self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
+        self.blocks = nn.ModuleList()
+        prev = 64
+        for i in range(self.num_res_blok):
+            self.blocks.append(CNNResidualBlock(prev, self.out_channels[i],
+                                                self.dilation[i], group_norm, sep_conv))
+            prev = self.out_channels[i]
+        if transpose:
+            self.outconv = nn.Conv2d(prev, num_bits_per_symbol, kernel_size=3, padding=1)
+        else:
+            self.outconv = nn.Conv2d(prev, num_bits_per_symbol, kernel_size=1)
+
+    def forward(self, x):
+        z = self.init_norm(x)
+        z = self.conv1(z)
+        for blk in self.blocks:
+            z = blk(z)
+        z = self.outconv(z)
+        return z
 
 
 # ================= 组合模型 =================
 
-from data_gen import qam_constellation, demap_llr
+from data_gen import qam_constellation
 from tokenizer import data_re_index
 
 # Sionna PUSCH 数据 RE 索引与维度
@@ -210,12 +269,15 @@ DATA_SYMB = DATA_RE_IDX[:, 1]
 
 
 class LWMLLR(nn.Module):
-    """LWM 骨干 + LLR decoder。输入 3D 信道 H (B,8,120,14) -> 数据 RE 的逐比特 LLR。"""
+    """LWM 骨干 + CNN LLR decoder。
+    输入 3D 信道 H (B,8,120,14) -> 数据 RE 的逐比特 LLR。
+    性能优化：输入不含 llr_base（无需传统软解调），decoder 为 CNN 残差网络。
+    """
 
     def __init__(self, backbone=None, freeze_backbone=False, device="cpu"):
         super().__init__()
         self.backbone = backbone if backbone is not None else lwm()
-        self.decoder = LLRDecoder()
+        self.decoder = CNNLLRDecoder()
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
@@ -236,33 +298,57 @@ class LWMLLR(nn.Module):
         seq = torch.cat([cls, patches], dim=2)             # (B, S, 129, 16)
         return seq.reshape(B * S, 129, 16)
 
-    def forward(self, H, z, sigma2, mod_oh, llr_base):
+    @staticmethod
+    def _build_feat(h_emb, patch, z, sigma2, mod_oh):
+        """
+        构建 CNN 输入特征图 (B, 88, n_symb, n_sc)：
+          通道 = channel_emb(64) + H_patch(16) + Re(z) + Im(z) + σ² + mod_oh(4) = 87，
+          补零到 88 满足 GroupNorm(groups=2)。
+          z 仅存在于数据 RE 位置（其余位置为 0，由 CNN 利用网格上下文）。
+        """
+        B = h_emb.shape[0]
+        dev = h_emb.device
+        feat = torch.cat([h_emb, patch], dim=-1)            # (B, S, SC, 80)
+        z_re = torch.zeros(B, N_SYMB_3D, N_SC_3D, device=dev, dtype=torch.float32)
+        z_im = torch.zeros_like(z_re)
+        b_idx = torch.arange(B, device=dev)[:, None].expand(B, N_DATA).reshape(-1)
+        s_idx = torch.as_tensor(DATA_SYMB, device=dev)[None, :].expand(B, N_DATA).reshape(-1)
+        c_idx = torch.as_tensor(DATA_SC, device=dev)[None, :].expand(B, N_DATA).reshape(-1)
+        z_re.index_put_((b_idx, s_idx, c_idx), z.real.reshape(-1))
+        z_im.index_put_((b_idx, s_idx, c_idx), z.imag.reshape(-1))
+        feat = torch.cat([feat, z_re[..., None], z_im[..., None]], dim=-1)  # (B, S, SC, 82)
+        s2 = sigma2.reshape(B, 1, 1, 1).expand(B, N_SYMB_3D, N_SC_3D, 1)
+        mo = mod_oh.reshape(B, 1, 1, -1).expand(B, N_SYMB_3D, N_SC_3D, -1)
+        feat = torch.cat([feat, s2, mo], dim=-1)            # (B, S, SC, 87)
+        feat = F.pad(feat, (0, 1))                          # 87 -> 88
+        return feat.permute(0, 3, 1, 2)                     # (B, 88, S, SC)
+
+    def forward(self, H, z, sigma2, mod_oh):
         """
         H: (B, 8, 120, 14) complex（Sionna PUSCH 3D 信道，含 DMRS 符号）
         z: (B, 1440) complex（数据 RE 均衡符号）
         sigma2: (B,)
         mod_oh: (B, 4)
-        llr_base: (B, 1440, 8) 传统均衡后软解调基线 LLR
-        -> llr (B, 1440, 8)（基线 + 修正量）
+        -> llr (B, 1440, 8)（LLR logits，正=bit1，裁剪到 ±MAX_LLR）
         """
         B = H.shape[0]
         input_ids = self._tokenize_3d(H)               # (B*14, 129, 16)
         output = self.backbone.encode(input_ids)       # (B*14, 129, 64)
-        h_emb = output[:, 1:1 + N_SC_3D, :]            # (B*14, 120, 64) 逐子载波
-        h_emb = h_emb.reshape(B, N_SYMB_3D, N_SC_3D, -1)  # (B, 14, 120, 64)
-        h_data = h_emb[:, DATA_SYMB, DATA_SC, :]       # (B, 1440, 64)
-        patch_all = input_ids[:, 1:1 + N_SC_3D, :].reshape(B, N_SYMB_3D, N_SC_3D, -1)
-        patch_data = patch_all[:, DATA_SYMB, DATA_SC, :]   # (B, 1440, 16)
-        return self.decoder(h_data, patch_data, z, sigma2, mod_oh, llr_base)
+        h_emb = output[:, 1:1 + N_SC_3D, :].reshape(B, N_SYMB_3D, N_SC_3D, -1)   # (B, 14, 120, 64)
+        patch = input_ids[:, 1:1 + N_SC_3D, :].reshape(B, N_SYMB_3D, N_SC_3D, -1)  # (B, 14, 120, 16)
+        feat = self._build_feat(h_emb, patch, z, sigma2, mod_oh)  # (B, 88, 14, 120)
+        logits = self.decoder(feat)                    # (B, 8, 14, 120)
+        logits = logits.permute(0, 2, 3, 1)            # (B, 14, 120, 8)
+        llr = logits[:, DATA_SYMB, DATA_SC, :]         # (B, 1440, 8)
+        return torch.clamp(llr, -config.MAX_LLR, config.MAX_LLR)
 
-    def infer_llr(self, H, z, sigma2, mod_order, sigma2_eq):
+    def infer_llr(self, H, z, sigma2, mod_order):
         """
         推理入口（Sionna 3D 信道）。
         H: (8, 120, 14) complex
         z: (1440,) complex（数据 RE 均衡符号）
         sigma2: float
         mod_order: int
-        sigma2_eq: (1440,)
         -> llr (1440, log2M) float32
         """
         self.eval()
@@ -272,15 +358,12 @@ class LWMLLR(nn.Module):
         mod_oh = np.zeros((1, config.MOD_ONHOT_DIM), dtype=np.float32)
         mod_oh[0, config.MOD_ORDERS.index(mod_order)] = 1.0
         X, btab = qam_constellation(mod_order)
-        llr_base = np.zeros((1, N_DATA, config.MAX_BITS), dtype=np.float32)
-        llr_base[0, :, :btab.shape[1]] = demap_llr(z, sigma2_eq, X, btab, config.MAX_LLR)
         with torch.no_grad():
             H_t = torch.tensor(H[None], dtype=torch.complex64, device=dev)
             z_t = torch.tensor(z[None], dtype=torch.complex64, device=dev)
             s2_t = torch.tensor([sigma2], dtype=torch.float32, device=dev)
             mo_t = torch.tensor(mod_oh, dtype=torch.float32, device=dev)
-            lb_t = torch.tensor(llr_base, dtype=torch.float32, device=dev)
-            llr = self(H_t, z_t, s2_t, mo_t, lb_t)[0].cpu().numpy()
+            llr = self(H_t, z_t, s2_t, mo_t)[0].cpu().numpy()
         return llr[:, :btab.shape[1]].astype(np.float32)
 
 
@@ -293,7 +376,7 @@ def load_official_backbone(device="cpu"):
 
 
 if __name__ == "__main__":
-    # 冒烟测试：官方权重加载 + 3D 前向
+    # 冒烟测试：官方权重加载 + 3D 前向（无 llr_base）
     bb = load_official_backbone()
     model = LWMLLR(bb).eval()
     H = torch.randn(2, 8, 120, 14, dtype=torch.complex64)
@@ -301,9 +384,10 @@ if __name__ == "__main__":
     s2 = torch.tensor([0.1, 0.2])
     mo = torch.zeros(2, 4)
     mo[:, 1] = 1.0
-    lb = torch.zeros(2, N_DATA, 8)
-    out = model(H, z, s2, mo, lb)
+    out = model(H, z, s2, mo)
     print("LWMLLR output:", tuple(out.shape), out.dtype)
     n_params = sum(p.numel() for p in model.parameters())
     print("total params:", n_params)
+    dec_params = sum(p.numel() for p in model.decoder.parameters())
+    print("decoder params:", dec_params)
     print("model OK")

@@ -30,7 +30,8 @@ def pack_samples(samples):
       H_est (n, 8, 120, 14) complex, z (n, 1440) complex,
       llr (n, 1440, 8), llr_base (n, 1440, 8), bits (n, 1440, 8),
       mod_oh (n, 4), sigma2 (n,), valid (n, 1440), nbits (n,)
-    llr_base: 传统均衡后软解调基线（残差学习锚点）
+    llr: 理想信道 max-log 参考 LLR（评估指标用）
+    llr_base: 传统均衡后软解调基线（仅评估对比用；模型输入已不含 llr_base）
     """
     n = len(samples)
     H_est = np.zeros((n, config.N_ANT, N_SC_3D, N_SYMB_3D), dtype=np.complex64)
