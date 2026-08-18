@@ -149,6 +149,22 @@ class lwm(nn.Module):
             output, _ = layer(output)
         return output
 
+    def encode_with_shallow(self, input_ids, shallow_layers=(3, 4, 5, 6)):
+        """
+        返回 (final, shallow_outs)：
+          final      : (B, T, 64) 最后一层输出
+          shallow_outs: list of (B, T, 64)，指定浅层（1-based 层号）的隐状态，
+                        供 LLR Decoder 作为多尺度特征输入（浅层保留更细粒度的
+                        局部信道模式，深层侧重全局上下文）。
+        """
+        output = self.embedding(input_ids)
+        shallow_outs = []
+        for i, layer in enumerate(self.layers):
+            output, _ = layer(output)
+            if (i + 1) in shallow_layers:
+                shallow_outs.append(output)
+        return output, shallow_outs
+
     def forward(self, input_ids, masked_pos):
         output = self.encode(input_ids)
         masked_pos = masked_pos.long()[:, :, None].expand(-1, -1, output.size(-1))
@@ -163,8 +179,11 @@ class lwm(nn.Module):
 # (符号 × 子载波) 全网格上预测逐比特 LLR logits，降低推理复杂度。
 
 # 特征通道数：64(emb)+16(H patch)+2(Re/Im z)+1(σ²)+4(mod_oh)=87
-# + 配置元数据 CFG_DIM=14（接收机已知的系统参数）-> 101，补零到 102 满足 GroupNorm(groups=2)
-FEAT_CH = 87 + config.CFG_DIM + (1 if (87 + config.CFG_DIM) % 2 else 0)
+# + 配置元数据 CFG_DIM=14 + LWM 浅层特征 len(SHALLOW_LAYERS)*64，
+# 补零到偶数满足 GroupNorm(groups=2)
+SHALLOW_FEAT_DIM = len(config.SHALLOW_LAYERS) * 64
+FEAT_CH = 87 + config.CFG_DIM + SHALLOW_FEAT_DIM + (
+    1 if (87 + config.CFG_DIM + SHALLOW_FEAT_DIM) % 2 else 0)
 
 
 class CNNResidualBlock(nn.Module):
@@ -301,18 +320,19 @@ class LWMLLR(nn.Module):
         return seq.reshape(B * S, n_sc + 1, 16)
 
     @staticmethod
-    def _build_feat(h_emb, patch, z, sigma2, mod_oh, data_re_idx, cfg):
+    def _build_feat(h_emb, patch, shallow_feat, z, sigma2, mod_oh, data_re_idx, cfg):
         """
         构建 CNN 输入特征图 (B, FEAT_CH, n_symb, n_sc)：
           通道 = channel_emb(64) + H_patch(16) + Re(z) + Im(z) + σ² + mod_oh(4)
-               + 配置元数据 cfg(CFG_DIM) = 87+CFG_DIM，补零到偶数满足 GroupNorm(2)。
+               + LWM 浅层特征 SHALLOW_LAYERS×64 + 配置元数据 cfg(CFG_DIM)，
+               补零到偶数满足 GroupNorm(2)。
           z 仅在数据 RE 位置有值（data_re_idx 为 (n_data,2) [sc,symb]），其余为 0。
           cfg: (B, CFG_DIM) 接收机已知的系统参数（天线/RB/符号/DMRS/TDL/速度）。
         """
         B = h_emb.shape[0]
         S, SC = h_emb.shape[1], h_emb.shape[2]
         dev = h_emb.device
-        feat = torch.cat([h_emb, patch], dim=-1)            # (B, S, SC, 80)
+        feat = torch.cat([h_emb, patch, shallow_feat], dim=-1)  # (B, S, SC, 80+shallow)
         z_re = torch.zeros(B, S, SC, device=dev, dtype=torch.float32)
         z_im = torch.zeros_like(z_re)
         n_data = len(data_re_idx)
@@ -321,15 +341,16 @@ class LWMLLR(nn.Module):
         c_idx = torch.as_tensor(data_re_idx[:, 0], device=dev)[None, :].expand(B, n_data).reshape(-1)
         z_re.index_put_((b_idx, s_idx, c_idx), z.real.reshape(-1))
         z_im.index_put_((b_idx, s_idx, c_idx), z.imag.reshape(-1))
-        feat = torch.cat([feat, z_re[..., None], z_im[..., None]], dim=-1)  # (B, S, SC, 82)
+        feat = torch.cat([feat, z_re[..., None], z_im[..., None]], dim=-1)  # (B, S, SC, 82+shallow)
         s2 = sigma2.reshape(B, 1, 1, 1).expand(B, S, SC, 1)
         mo = mod_oh.reshape(B, 1, 1, -1).expand(B, S, SC, -1)
         cfg_v = cfg.reshape(B, 1, 1, -1).expand(B, S, SC, -1)
-        feat = torch.cat([feat, s2, mo, cfg_v], dim=-1)     # (B, S, SC, 87+CFG_DIM)
+        feat = torch.cat([feat, s2, mo, cfg_v], dim=-1)     # (B, S, SC, 87+CFG_DIM+shallow)
         n_pad = FEAT_CH - feat.shape[-1]
         if n_pad > 0:
             feat = F.pad(feat, (0, n_pad))                  # 补零到偶数
-        return feat.permute(0, 3, 1, 2)                     # (B, FEAT_CH, S, SC)
+        # 显式 contiguous：torch 2.13 的 CPU GroupNorm backward 对非连续输入段错误
+        return feat.permute(0, 3, 1, 2).contiguous()        # (B, FEAT_CH, S, SC)
 
     def forward(self, H, z, sigma2, mod_oh, data_re_idx, cfg):
         """
@@ -343,10 +364,16 @@ class LWMLLR(nn.Module):
         """
         B, _, n_sc, n_symb = H.shape
         input_ids = self._tokenize_3d(H)               # (B*n_symb, n_sc+1, 16)
-        output = self.backbone.encode(input_ids)       # (B*n_symb, n_sc+1, 64)
+        output, shallow = self.backbone.encode_with_shallow(
+            input_ids, shallow_layers=config.SHALLOW_LAYERS)
         h_emb = output[:, 1:1 + n_sc, :].reshape(B, n_symb, n_sc, -1)   # (B, S, SC, 64)
         patch = input_ids[:, 1:1 + n_sc, :].reshape(B, n_symb, n_sc, -1)  # (B, S, SC, 16)
-        feat = self._build_feat(h_emb, patch, z, sigma2, mod_oh, data_re_idx, cfg)  # (B,FEAT_CH,S,SC)
+        # 浅层特征拼接：每层 (B*S, n_sc+1, 64) -> (B, S, SC, 64) -> 沿通道拼接
+        shallow_feat = torch.cat([
+            s[:, 1:1 + n_sc, :].reshape(B, n_symb, n_sc, -1) for s in shallow
+        ], dim=-1)                                      # (B, S, SC, len*64)
+        feat = self._build_feat(h_emb, patch, shallow_feat, z, sigma2, mod_oh,
+                                data_re_idx, cfg)       # (B,FEAT_CH,S,SC)
         logits = self.decoder(feat)                    # (B, 8, S, SC)
         logits = logits.permute(0, 2, 3, 1)            # (B, S, SC, 8)
         dr = np.asarray(data_re_idx)

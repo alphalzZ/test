@@ -30,6 +30,9 @@ MAX_SPEEDS = [0.0, 5.0, 30.0]           # UE 速度 m/s（多普勒 0/58/350Hz @
 CNN_SEP_CONV = True      # 残差块使用深度可分离卷积（depthwise 3x3 + pointwise 1x1）
 CNN_TRANSPOSE = True     # 首层用转置卷积（Conv2DTranspose 风格，padding 保持网格尺寸）
 CNN_GROUP_NORM = True    # 残差块内使用 GroupNorm
+# LWM 浅层特征（1-based 层号）：CNN Decoder 额外输入第 3~6 层的隐状态，
+# 浅层保留更细粒度的局部信道模式，与深层全局上下文互补
+SHALLOW_LAYERS = (3, 4, 5, 6)
 # 配置元数据通道（接收机已知的系统参数，帮助模型区分配置）：
 # [n_rx onehot(4), n_sc/120, n_symb/14, dmrs_ap onehot(3), tdl onehot(4), speed/30]
 CFG_DIM = 14
@@ -58,7 +61,10 @@ GRAD_ACCUM = 8
 PT_LR = 1e-5             # MCM 预训练学习率
 PT_MASK_RATIO = 0.15     # MCM mask 比例
 LR = 1e-4                # decoder 学习率
-LR_BACKBONE = 1e-6       # LWM 骨干学习率（微调）
+# 两阶段微调：阶段2a 冻结骨干只训 decoder（FT_FREEZE_EPOCHS 轮），
+# 阶段2b 解冻骨干联合微调（骨干 lr=1e-4 量级，充分发挥 MCM 域适配价值）
+LR_BACKBONE = 1e-4       # LWM 骨干学习率（联合微调阶段）
+FT_FREEZE_EPOCHS = 20    # 冻结骨干阶段 epoch 数（前段）
 SEED = 7
 
 # 评估

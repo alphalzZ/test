@@ -9,6 +9,12 @@
 × TDL-A/B/C/D × 时延/多普勒，训练数据为各种配置的混合（每配置组合多样本）。
 训练时按 (n_sc, n_symb, n_rx, n_data) 分桶（batch 内同配置，CNN 特征图尺寸一致）。
 
+**两阶段微调**：
+  阶段 2a（冻结骨干）：只训 decoder（lr=1e-4），让 decoder 先收敛；
+  阶段 2b（联合微调）：解冻骨干，decoder + 骨干联合微调（骨干 lr=1e-4 量级），
+  充分发挥 MCM 继续预训练的域适配价值。
+  CNN Decoder 输入含 LWM 浅层（3~6 层）特征（多尺度信道模式）。
+
 用法：
   python train_llr.py                       # 用阶段1权重微调（主模型）
   python train_llr.py --no-pretrain         # 用官方权重微调（对照模型）
@@ -99,22 +105,33 @@ def train(args):
         ckpt_out = config.CKPT_LLR
         print("[FT] 主模式：加载继续预训练权重")
 
-    model = LWMLLR(backbone, freeze_backbone=args.freeze_backbone).to(device)
+    model = LWMLLR(backbone, freeze_backbone=False).to(device)
     print(f"[FT] total params={sum(p.numel() for p in model.parameters())/1e3:.1f}K, "
-          f"batch={args.batch}, grad_accum={args.grad_accum}")
+          f"batch={args.batch}, grad_accum={args.grad_accum}, "
+          f"backbone_lr={args.lr_backbone}")
 
-    # 分组学习率
-    if args.freeze_backbone:
-        params = [{"params": model.decoder.parameters(), "lr": args.lr}]
-    else:
-        params = [
-            {"params": model.decoder.parameters(), "lr": args.lr},
-            {"params": model.backbone.parameters(), "lr": args.lr_backbone},
-        ]
-    optimizer = torch.optim.AdamW(params, weight_decay=1e-5)
+    def make_optimizer(freeze):
+        """freeze=True: 只训 decoder；freeze=False: decoder + 骨干联合微调"""
+        for p in model.backbone.parameters():
+            p.requires_grad = not freeze
+        if freeze:
+            params = [{"params": model.decoder.parameters(), "lr": args.lr}]
+            tag = "freeze backbone, train decoder only"
+        else:
+            params = [
+                {"params": model.decoder.parameters(), "lr": args.lr},
+                {"params": model.backbone.parameters(), "lr": args.lr_backbone},
+            ]
+            tag = "unfreeze backbone, joint finetune"
+        print(f"[FT] 阶段切换 -> {tag}")
+        return torch.optim.AdamW(params, weight_decay=1e-5)
+
+    optimizer = make_optimizer(freeze=True)   # 阶段2a：冻结骨干训 decoder
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
+        if epoch == args.freeze_epochs + 1:   # 阶段2b：解冻骨干联合微调
+            optimizer = make_optimizer(freeze=False)
         t0 = time.time()
         model.train()
         run = 0.0
@@ -150,8 +167,9 @@ def train(args):
         tl = run / max(n_batch, 1)
         vl = vrun / max(n_vb, 1)
         vb = vber / max(n_vb, 1)
-        print(f"[FT] epoch {epoch}/{args.epochs}  train={tl:.5f}  val={vl:.5f}  "
-              f"valBER={vb:.4f}  ({time.time()-t0:.1f}s)")
+        phase = "2a-freeze" if epoch <= args.freeze_epochs else "2b-joint"
+        print(f"[FT] epoch {epoch}/{args.epochs}({phase})  train={tl:.5f}  "
+              f"val={vl:.5f}  valBER={vb:.4f}  ({time.time()-t0:.1f}s)")
         if vl < best_val:
             best_val = vl
             torch.save(model.state_dict(), ckpt_out)
@@ -166,11 +184,12 @@ if __name__ == "__main__":
     p.add_argument("--val-n", type=int, default=config.VAL_N)
     p.add_argument("--pt-n", type=int, default=config.PT_N)
     p.add_argument("--epochs", type=int, default=config.FT_EPOCHS)
+    p.add_argument("--freeze-epochs", type=int, default=config.FT_FREEZE_EPOCHS,
+                   help="阶段2a 冻结骨干训 decoder 的 epoch 数（之后联合微调）")
     p.add_argument("--batch", type=int, default=config.BATCH)
     p.add_argument("--grad-accum", type=int, default=config.GRAD_ACCUM)
     p.add_argument("--lr", type=float, default=config.LR)
     p.add_argument("--lr-backbone", type=float, default=config.LR_BACKBONE)
     p.add_argument("--seed", type=int, default=config.SEED)
     p.add_argument("--no-pretrain", action="store_true", help="对照：官方权重直接微调")
-    p.add_argument("--freeze-backbone", action="store_true", help="冻结骨干只训 decoder")
     train(p.parse_args())
