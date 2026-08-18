@@ -91,11 +91,15 @@ def train(args):
     print(f"[FT] 训练样本 {len(tr)}（{tr_loader.n_groups} 种 (n_sc,n_symb) 配置），"
           f"验证样本 {len(va)}（{va_loader.n_groups} 种配置）")
 
-    # 骨干初始化
+    # 骨干初始化（config.USE_PRETRAIN=False 时主模型也用官方权重直接微调）
     if args.no_pretrain:
         backbone = load_official_backbone(device=device)
         ckpt_out = config.CKPT_LLR_NO_PT
         print("[FT] 对照模式：使用官方权重（无继续预训练）")
+    elif not config.USE_PRETRAIN:
+        backbone = load_official_backbone(device=device)
+        ckpt_out = config.CKPT_LLR
+        print("[FT] 主模式（USE_PRETRAIN=False）：官方权重直接微调（无 MCM 预训练）")
     else:
         if not os.path.exists(config.CKPT_PRETRAIN):
             raise FileNotFoundError(f"未找到继续预训练权重 {config.CKPT_PRETRAIN}，请先运行 train_pretrain.py")

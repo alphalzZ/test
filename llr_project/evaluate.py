@@ -106,21 +106,26 @@ def eval_sample(sample, model=None, model_nopt=None):
 
 def eval_cfg(rng, i, snr):
     """确定性配置循环（覆盖各维度）：天线 1/2/4/8 × RB 1~10 × 符号 3~14
-    × DMRS 0/1/2 × TDL A/B/C/D × 速度 0/5/30，随样本序号循环偏移"""
+    × DMRS 0/1/2 × TDL A/B/C/D × 速度 0/5/30，随样本序号循环偏移。
+    ★ 共线修复：tdl/speed 的取模偏移改用 SNR（si=int(snr)）引入第二自由度——
+    旧版 tdl 偏移 +4≡0(mod4) 与天线完全共线、speed 偏移 +6≡0(mod3) 与 DMRS 完全共线，
+    导致"按 TDL"表 ≡ "按天线"表、"按速度"表 ≡ "按 DMRS"表，维度无法独立解读。
+    现 tdl 偏移 si%4∈{3,0,1,2}、speed 偏移 si%3∈{1,0,2} 覆盖全部相位，解除了完全共线。"""
     ants = config.RX_ANTS
     rbs = [1, 2, 3, 4, 6, 8, 10]
     symbs = [3, 5, 7, 10, 14]
     aps = [0, 1, 2]
     tdls = ["A", "B", "C", "D"]
     speeds = [0.0, 5.0, 30.0]
+    si = int(round(snr))
     return {
         "num_rx_ant": ants[(i + 0) % len(ants)],
         "n_size_grid": rbs[(i + 1) % len(rbs)],
         "num_ofdm_symbols": symbs[(i + 2) % len(symbs)],
         "dmrs_ap": aps[(i + 3) % len(aps)],
-        "channel_model": tdls[(i + 4) % len(tdls)],
+        "channel_model": tdls[(i + si) % len(tdls)],
         "delay_spread": config.DELAY_SPREADS[(i + 5) % 3],
-        "max_speed": speeds[(i + 6) % len(speeds)],
+        "max_speed": speeds[(i + si) % len(speeds)],
         "carrier_frequency": config.CARRIER_FREQUENCY,
     }
 

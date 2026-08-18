@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 夜间大规模训练方案（约 12 小时预算，实测 ~8.5 小时）
-#   数据生成（分集缓存，断点续跑）-> MCM 预训练 -> 两阶段微调(主+对照) -> 评估
+# 夜间大规模训练方案 v2（约 2.8 小时，实测基准外推）
+#   数据生成（分片缓存，断点续跑）-> 两阶段微调（官方权重，14 冻结 + 8 联合）-> 评估
+# v2 改动（基于 v1 性能分析）：砍掉 MCM 预训练（收益≈噪声级）+ 砍训练轮数 48→22
 # 用法: ./train_night.sh          （可重复执行：已完成步骤自动跳过）
 # 依赖: llr_project/night_config.py（已创建；删除它即恢复白天小规模配置）
-# 产物: weights/*_night.pt, data/pusch_night_*.pkl, eval_ber_curves.png 等
+# 产物: weights/lwm_llr_night.pt, data/pusch_night_{train,val}.pkl.*, eval_results.json 等
 # =============================================================================
 set -e
 cd "$(dirname "$0")"
@@ -12,16 +13,16 @@ PY=/home/le-lei/workspace/test/.venv/bin/python
 W=weights
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "========== [0/5] 配置确认 =========="
+echo "========== [0/4] 配置确认 =========="
 $PY -c "
 import config
-print(f'  PT_N={config.PT_N}  TRAIN_N={config.TRAIN_N}  VAL_N={config.VAL_N}')
-print(f'  PT_EPOCHS={config.PT_EPOCHS}  FT_EPOCHS={config.FT_EPOCHS} (freeze {config.FT_FREEZE_EPOCHS}+joint)')
+print(f'  USE_PRETRAIN={config.USE_PRETRAIN}  TRAIN_N={config.TRAIN_N}  VAL_N={config.VAL_N}')
+print(f'  FT_EPOCHS={config.FT_EPOCHS} (freeze {config.FT_FREEZE_EPOCHS}+joint)')
 print(f'  ckpt: {config.CKPT_LLR}')
 print(f'  cache: {config.CACHE_TRAIN}')
 "
 
-echo "========== [1/5] 数据生成（分片缓存，断点续跑，约 1.5~2 小时） =========="
+echo "========== [1/4] 数据生成（分片缓存，断点续跑，约 1.4 小时） =========="
 $PY -c "
 from dataset import build_data
 import config
@@ -30,20 +31,14 @@ build_data(config.TRAIN_N, config.VAL_N, config.PT_N, config.SEED,
 print('  数据全部就绪')
 "
 
-echo "========== [2/5] 阶段1: MCM 继续预训练（约 0.5 小时） =========="
-[ -f "$W/lwm_continued_night.pt" ] || $PY train_pretrain.py
-
-echo "========== [3/5] 阶段2: LLR 两阶段微调 - 主模型（约 2.9 小时） =========="
+echo "========== [2/4] LLR 两阶段微调（官方权重，22 epoch，约 1.3 小时） =========="
 [ -f "$W/lwm_llr_night.pt" ] || $PY train_llr.py
 
-echo "========== [4/5] 阶段2: LLR 两阶段微调 - 对照（官方权重，无预训练；约 2.9 小时） =========="
-[ -f "$W/lwm_llr_no_pretrain_night.pt" ] || $PY train_llr.py --no-pretrain
-
-echo "========== [5/5] 性能评估（96 样本，约 1 分钟） =========="
+echo "========== [3/4] 性能评估（96 样本，约 1 分钟） =========="
 $PY evaluate.py
 
 echo "=============================================================="
 echo " 夜间训练全部完成！结果:"
-echo "   - 权重: $W/lwm_llr_night.pt (主) / $W/lwm_llr_no_pretrain_night.pt (对照)"
+echo "   - 权重: $W/lwm_llr_night.pt"
 echo "   - 评估: eval_results.json + eval_ber_curves.png"
 echo "=============================================================="

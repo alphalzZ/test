@@ -51,7 +51,10 @@ CKPT_LLR_NO_PT = os.path.join(WEIGHTS_DIR, "lwm_llr_no_pretrain.pt")  # 阶段2:
 
 # ================= 训练（多配置大规模版：每配置组合 8 个不同样本） =================
 GROUP_SIZE = 8           # 每个配置组合生成的样本数（不同信道/噪声/比特实现）
-PT_N = 2000              # 阶段1 MCM 样本数（250 组合 × 8）
+# MCM 继续预训练开关：True=阶段1（预训练后微调，主模型）；False=砍掉阶段1，
+# 主模型直接用官方权重微调（实测 MCM 收益≈噪声级，夜间版设为 False 省 ~0.5h+0.8GB 数据）。
+USE_PRETRAIN = True
+PT_N = 2000              # 阶段1 MCM 样本数（250 组合 × 8；USE_PRETRAIN=False 时置 0 跳过生成）
 TRAIN_N = 2400           # 阶段2 训练样本数（300 组合 × 8）
 VAL_N = 160              # 验证样本数（20 组合 × 8）
 PT_EPOCHS = 15
