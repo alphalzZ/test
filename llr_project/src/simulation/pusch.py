@@ -144,6 +144,8 @@ class SionnaPUSCHSystem:
         self._stream_manager = StreamManagement(np.array([[1]]), 1)
         self._lmmse = LMMSEEqualizer(self.rg, self._stream_manager, device=device)
         self._demapper = None                           # 按调制阶数懒创建
+        self._demapper_k = None
+        self._tx_mod = 4                                # __init__ 已构建的发射机调制阶数
 
     def _channel_lags(self):
         """
@@ -204,9 +206,11 @@ class SionnaPUSCHSystem:
         k = int(np.log2(mod_order))
         X, btab = qam_constellation(mod_order)
 
-        # ---- 发射 ----
-        self.pusch_tx = PUSCHTransmitter(self.pusch, return_bits=True,
-                                         output_domain="freq", device=self.device)
+        # ---- 发射（transmitter 按调制阶数缓存：组内 mod 固定时避免反复重建） ----
+        if self._tx_mod != mod_order:
+            self.pusch_tx = PUSCHTransmitter(self.pusch, return_bits=True,
+                                             output_domain="freq", device=self.device)
+            self._tx_mod = mod_order
         x, b = self.pusch_tx(batch_size)      # x: (B,1,1,S,fft_bwp)
 
         # ---- 嵌入系统网格（固定带宽）-> OFDM 调制 -> 信道 -> 解调 ----
@@ -332,18 +336,24 @@ def sample_config(rng, rx_ants=None, rb_range=None, symb_range=None,
 
 
 def generate_dataset(n_samples, seed=0, snr_db=None, batch_size=32,
-                     cfg_sampler=None, group_size=1):
+                     cfg_sampler=None, group_size=1, sub_batch=2):
     """
     多配置混合样本生成（大规模版）。
     先采样 n_combos = ceil(n_samples/group_size) 个系统配置，每个配置组合生成
     group_size 个**不同**样本（不同信道实现/噪声/比特），同配置样本一组生成
     （组件复用）。SNR/调制逐组随机（snr_db 给定时固定 SNR）。
+
+    sub_batch：组内每次 generate_batch 的批量上限。Sionna TDL sum-of-sinusoids
+    采样会构造 (B, n_rx, n_clusters, n_time_steps, n_sinusoids) 的中间张量，
+    B=8 时瞬时内存峰值可达 9~15GB（15GB 机器直接 OOM）；拆成小批量循环生成
+    可把峰值按比例压低（sub_batch=2 时峰值约降至 1/4），样本内容不受影响。
     """
     rng = np.random.default_rng(seed)
     from src.utils import config
     mod_orders = config.MOD_ORDERS
     if cfg_sampler is None:
         cfg_sampler = sample_config
+    sub_batch = max(1, int(sub_batch))
     n_combos = int(np.ceil(n_samples / group_size))
     cfgs = [cfg_sampler(rng) for _ in range(n_combos)]
     groups = {}
@@ -357,16 +367,21 @@ def generate_dataset(n_samples, seed=0, snr_db=None, batch_size=32,
         sys = SionnaPUSCHSystem(**cfg)
         n_here = min(len(cis), n_samples - idx)
         mod = int(mod_orders[rng.integers(0, len(mod_orders))])
-        s = float(rng.uniform(-5, 25)) if snr_db is None else float(snr_db)
-        batch = sys.generate_batch(n_here, s, mod, seed=seed + gi)
-        for j in range(n_here):
-            # 注意：data_re_idx 是配置级共享（batch 内相同），不能按 batch 维切片
-            d = {k: (v[j] if isinstance(v, np.ndarray) and v.ndim > 0 and k != "data_re_idx"
-                     else v) for k, v in batch.items()}
-            d["snr_db"] = s
-            d["cfg"] = dict(cfg)
-            samples[idx] = d
-            idx += 1
+        s = float(rng.uniform(-10, 35)) if snr_db is None else float(snr_db)
+        for lo in range(0, n_here, sub_batch):
+            hi = min(lo + sub_batch, n_here)
+            # 子批 seed 相互独立（逐组逐子批推进），保证同配置组内样本各不相同
+            batch = sys.generate_batch(hi - lo, s, mod, seed=seed + gi * 16 + lo)
+            for j in range(hi - lo):
+                # 注意：data_re_idx 是配置级共享（batch 内相同），不能按 batch 维切片
+                d = {k: (v[j] if isinstance(v, np.ndarray) and v.ndim > 0
+                         and k != "data_re_idx" else v)
+                     for k, v in batch.items()}
+                d["snr_db"] = s
+                d["cfg"] = dict(cfg)
+                samples[idx] = d
+                idx += 1
+        del sys
     return samples
 
 
@@ -385,11 +400,11 @@ if __name__ == "__main__":
             print(f"  {k}: {v}")
     # 验证 LLR 硬判决正确率（高 SNR，全配置应 ≈1.0）
     for cfg, mod in [(dict(num_rx_ant=1, n_size_grid=1, num_ofdm_symbols=3, dmrs_ap=0,
-                           channel_model="D", delay_spread=300e-9, max_speed=30.0), 16),
+                           channel_model="D", delay_spread=300e-9, max_speed=30.0), 64),
                      (dict(num_rx_ant=8, n_size_grid=10, num_ofdm_symbols=14, dmrs_ap=2,
                            channel_model="A", delay_spread=30e-9, max_speed=0.0), 64)]:
-        s2 = SionnaPUSCHSystem(**cfg).generate_batch(4, 25.0, mod)
-        hard = (s2["llr_ref"] > 0).astype(int)
+        s2 = SionnaPUSCHSystem(**cfg).generate_batch(4, 35.0, mod)
+        hard = (s2["llr_base"] > 0).astype(int)
         acc = np.mean(hard == s2["bits_tx"])
         print(f"{cfg['num_rx_ant']}rx/{cfg['n_size_grid']}RB/{cfg['num_ofdm_symbols']}symb "
-              f"QAM{mod}@25dB LLR 硬判决准确率: {acc:.4f}")
+              f"QAM{mod}@35dB LLR 硬判决准确率: {acc:.4f}")

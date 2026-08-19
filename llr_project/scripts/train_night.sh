@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 夜间大规模训练方案 v2（约 2.8 小时，实测基准外推）
-#   数据生成（分片缓存，断点续跑）-> 两阶段微调（官方权重，14 冻结 + 8 联合）-> 评估
+# 夜间大规模训练方案 v2（约 5 小时，实测基准外推）
+#   数据生成（分片缓存，断点续跑，sub_batch=2 控制内存峰值）-> 两阶段微调
+#   （官方权重，14 冻结 + 8 联合）-> 评估
 # v2 改动（基于 v1 性能分析）：砍掉 MCM 预训练（收益≈噪声级）+ 砍训练轮数 48→22
+# v3 改动（OOM 修复）：Sionna TDL 采样瞬时峰值 9~15GB 导致 15GB 机器被杀；
+#   组内生成拆小批量（SUB_BATCH=2，峰值降至 ~3GB）+ 分片参数指纹（参数变更
+#   自动重生成）+ 每片后归还 glibc 内存。
 # 用法: ./scripts/train_night.sh   （可重复执行：已完成步骤自动跳过）
 # 配置: configs/night.json（通过环境变量 LLR_CFG=night 加载，见 src/utils/config.py）
 # 产物: experiments/checkpoints/lwm_llr_night.pt,
@@ -24,7 +28,7 @@ print(f'  ckpt: {config.CKPT_LLR}')
 print(f'  cache: {config.CACHE_TRAIN}')
 "
 
-echo "========== [1/4] 数据生成（分片缓存，断点续跑，约 1.4 小时） =========="
+echo "========== [1/4] 数据生成（分片缓存，断点续跑） =========="
 $PY -c "
 from src.datasets.loader import build_data
 from src.utils import config

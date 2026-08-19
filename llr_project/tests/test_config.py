@@ -42,6 +42,9 @@ class TestConfig(unittest.TestCase):
 
     def test_night_override(self):
         """子进程设置 LLR_CFG=night，验证 configs/night.json 覆盖生效"""
+        with open(os.path.join(_ROOT, "configs", "night.json"), encoding="utf-8") as f:
+            import json
+            night = json.load(f)
         code = ("from src.utils import config; "
                 "print(config.TRAIN_N, config.FT_EPOCHS, config.USE_PRETRAIN, "
                 "config.CKPT_LLR)")
@@ -50,10 +53,10 @@ class TestConfig(unittest.TestCase):
                            capture_output=True, text=True, cwd=_ROOT)
         self.assertEqual(r.returncode, 0, r.stderr)
         out = r.stdout.strip().split()
-        self.assertEqual(out[0], "50000")                     # TRAIN_N
-        self.assertEqual(out[1], "22")                        # FT_EPOCHS
-        self.assertEqual(out[2], "False")                     # USE_PRETRAIN
-        self.assertTrue(out[3].endswith("lwm_llr_night.pt"))  # CKPT_LLR
+        self.assertEqual(int(out[0]), int(night["TRAIN_N"]))   # 与 night.json 一致
+        self.assertEqual(int(out[1]), int(night["FT_EPOCHS"])) # FT_EPOCHS
+        self.assertEqual(out[2], "False")                      # USE_PRETRAIN
+        self.assertTrue(out[3].endswith("lwm_llr_night.pt"))   # CKPT_LLR
 
 
 if __name__ == "__main__":
