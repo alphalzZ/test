@@ -2,7 +2,7 @@
 """
 PyTorch Dataset 工具：多配置样本 -> 桶式训练 batch
 
-样本格式（data_gen_sionna 输出，多配置自适应）：
+样本格式（src/simulation/pusch.py 的 SionnaPUSCHSystem 输出，多配置自适应）：
   H_est(n_rx,n_sc,n_symb)complex, H_true, z(n_data,)complex,
   sigma2, sigma2_eq(n_data,), llr_ref(n_data,log2M), bits_tx(n_data,log2M),
   mod_order, n_rx/n_sc/n_symb/n_data, dmrs_ap/tdl/delay_spread/max_speed,
@@ -12,10 +12,15 @@ n_data 随配置变化（如 14 符号 {1+1} × 120 子载波 = 1440；3 符号 
 """
 import os
 import pickle
+import sys
 
 import numpy as np
 
-import config
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from src.utils import config
 
 
 def build_cfg_vec(batch):
@@ -186,7 +191,7 @@ def build_data(n_train, n_val, n_pt, seed, cache_tr, cache_va, cache_pt,
       断点续跑粒度到分片级；训练时 load_samples_shards 合并加载。
     返回 (tr_samples, va_samples, pt_samples)。
     """
-    from data_gen_sionna import generate_dataset
+    from src.simulation.pusch import generate_dataset
     if all(_cache_ready(p) for p in (cache_tr, cache_va, cache_pt)):
         print("[DATA] 加载缓存数据")
         return (load_samples_shards(cache_tr), load_samples_shards(cache_va),

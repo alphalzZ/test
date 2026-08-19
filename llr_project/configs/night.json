@@ -1,0 +1,17 @@
+{
+  "GROUP_SIZE": 8,
+  "USE_PRETRAIN": false,
+  "PT_N": 0,
+  "TRAIN_N": 50000,
+  "VAL_N": 1000,
+  "PT_EPOCHS": 0,
+  "FT_EPOCHS": 22,
+  "FT_FREEZE_EPOCHS": 14,
+  "EVAL_PER_SNR": 16,
+  "CKPT_PRETRAIN_FILE": "lwm_continued_night.pt",
+  "CKPT_LLR_FILE": "lwm_llr_night.pt",
+  "CKPT_LLR_NO_PT_FILE": "lwm_llr_no_pretrain_night.pt",
+  "CACHE_PT_FILE": "pusch_night_pt.pkl",
+  "CACHE_TRAIN_FILE": "pusch_night_train.pkl",
+  "CACHE_VAL_FILE": "pusch_night_val.pkl"
+}

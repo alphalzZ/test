@@ -214,8 +214,8 @@ config/secrets/
 *.dsh
 .dsh/
 
-# ---- LWM-LLR 项目：数据缓存与权重不入库 ----
+# ---- LWM-LLR 项目：数据缓存与权重不入库（项目级 .gitignore 见 llr_project/.gitignore） ----
 llr_project/data/
-llr_project/weights/
+llr_project/experiments/checkpoints/
 *.npz
 *.h5

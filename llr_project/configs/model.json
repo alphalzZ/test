@@ -1,0 +1,10 @@
+{
+  "MOD_ORDERS": [4, 16, 64, 256],
+  "MAX_BITS": 8,
+  "MOD_ONHOT_DIM": 4,
+  "CNN_SEP_CONV": true,
+  "CNN_TRANSPOSE": true,
+  "CNN_GROUP_NORM": true,
+  "SHALLOW_LAYERS": [3, 4, 5, 6],
+  "CFG_DIM": 14
+}

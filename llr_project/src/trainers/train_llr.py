@@ -29,11 +29,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config
-from dataset import (BucketedLoader, build_data,
-                     load_samples_pkl, save_samples_pkl)
-from model import LWMLLR, load_official_backbone
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from src.utils import config
+from src.datasets.loader import (BucketedLoader, build_data,
+                                 load_samples_pkl, save_samples_pkl)
+from src.models.lwm_llr import LWMLLR, load_official_backbone
 
 
 def bit_mask_like(nbits, shape, device):

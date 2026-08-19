@@ -31,8 +31,15 @@ from sionna.phy.ofdm import OFDMModulator, OFDMDemodulator, ResourceGrid
 from sionna.phy.channel.tr38901 import TDL
 from sionna.phy.channel import TimeChannel, time_to_ofdm_channel
 
-import config
-from data_gen import qam_constellation
+import os
+import sys
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from src.utils import config
+from src.datasets.demap import qam_constellation
 
 
 class SionnaPUSCHSystem:
@@ -290,7 +297,7 @@ def sample_config(rng, rx_ants=None, rb_range=None, symb_range=None,
                   dmrs_aps=None, tdl_models=None, delay_spreads=None,
                   max_speeds=None):
     """随机采样一个系统配置 dict（多配置空间）"""
-    import config
+    from src.utils import config
     return {
         "num_rx_ant": int(rng.choice(rx_ants or config.RX_ANTS)),
         "n_size_grid": int(rng.integers(*(rb_range or config.RB_RANGE))),
@@ -312,7 +319,7 @@ def generate_dataset(n_samples, seed=0, snr_db=None, batch_size=32,
     （组件复用）。SNR/调制逐组随机（snr_db 给定时固定 SNR）。
     """
     rng = np.random.default_rng(seed)
-    import config
+    from src.utils import config
     mod_orders = config.MOD_ORDERS
     if cfg_sampler is None:
         cfg_sampler = sample_config

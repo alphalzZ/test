@@ -1,0 +1,17 @@
+# ==================================================
+# LWM-LLR 项目级 .gitignore（叠加在仓库根 .gitignore 之上）
+# ==================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# ---- 数据与产物（体积大或可再生，不入库） ----
+data/                      # Sionna 生成的数据缓存（pusch_*.pkl.* 分片）
+experiments/checkpoints/   # 训练权重（*.pt）
+experiments/logs/          # 训练/仿真日志
+
+# ---- 二进制数据文件 ----
+*.npz
+*.h5

@@ -21,11 +21,13 @@ import time
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config
-from data_gen import qam_constellation, demap_llr
-from data_gen_sionna import SionnaPUSCHSystem
-from model import LWMLLR, load_official_backbone
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from src.utils import config
+from src.datasets.demap import qam_constellation, demap_llr
+from src.simulation.pusch import SionnaPUSCHSystem
+from src.models.lwm_llr import LWMLLR, load_official_backbone
 
 import matplotlib
 matplotlib.use("Agg")
@@ -235,13 +237,13 @@ def main():
         ax.grid(True, which="both", alpha=0.3)
         ax.legend()
         plt.tight_layout()
-        png = os.path.join(config.BASE_DIR, "eval_ber_curves.png")
+        png = config.EVAL_CURVES
         plt.savefig(png, dpi=130)
         print(f"\n图已保存: {png}")
 
-    with open(os.path.join(config.BASE_DIR, "eval_results.json"), "w") as f:
+    with open(config.EVAL_RESULTS, "w") as f:
         json.dump({"results": results}, f, indent=2)
-    print("结果已保存: eval_results.json")
+    print(f"结果已保存: {config.EVAL_RESULTS}")
 
 
 if __name__ == "__main__":

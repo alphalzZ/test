@@ -1,0 +1,18 @@
+{
+  "GROUP_SIZE": 8,
+  "USE_PRETRAIN": true,
+  "PT_N": 2000,
+  "TRAIN_N": 2400,
+  "VAL_N": 160,
+  "PT_EPOCHS": 15,
+  "FT_EPOCHS": 40,
+  "BATCH": 8,
+  "GRAD_ACCUM": 8,
+  "PT_LR": 1.0e-05,
+  "PT_MASK_RATIO": 0.15,
+  "LR": 0.0001,
+  "LR_BACKBONE": 0.0001,
+  "FT_FREEZE_EPOCHS": 20,
+  "SEED": 7,
+  "SHARD_SIZE": 5000
+}

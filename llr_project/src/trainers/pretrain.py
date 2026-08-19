@@ -19,10 +19,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config
-from dataset import build_data
-from model import load_official_backbone, LWMLLR
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from src.utils import config
+from src.datasets.loader import build_data
+from src.models.lwm_llr import load_official_backbone, LWMLLR
 
 
 def make_pt_batches(samples, batch_size, seed):

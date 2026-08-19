@@ -46,11 +46,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config
-from data_gen import qam_constellation, demap_llr
-from data_gen_sionna import SionnaPUSCHSystem
-from evaluate import load_llr_model, sample_cfg_vec, pearson_corr
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from src.utils import config
+from src.datasets.demap import qam_constellation, demap_llr
+from src.simulation.pusch import SionnaPUSCHSystem
+from src.evaluation.evaluate import load_llr_model, sample_cfg_vec, pearson_corr
 
 import matplotlib
 matplotlib.use("Agg")
@@ -250,13 +252,14 @@ def run_experiment(args):
 
     # ---- 保存 ----
     tag = f"_{args.tag}" if args.tag else ""
-    out_json = f"experiment{tag}_results.json"
+    out_json = os.path.join(config.RESULTS_DIR, f"experiment{tag}_results.json")
     with open(out_json, "w") as f:
         json.dump({"args": vars(args), "results": records}, f, indent=2)
     print(f"[EXP] 结果已保存: {out_json}")
-    plot_ber_curves(records, args, f"experiment{tag}_ber_curves.png",
-                    f"experiment{tag}_ber_by_mod.png")
-    print(f"[EXP] 曲线已保存: experiment{tag}_ber_curves.png / "
+    plot_ber_curves(records, args,
+                    os.path.join(config.RESULTS_DIR, f"experiment{tag}_ber_curves.png"),
+                    os.path.join(config.RESULTS_DIR, f"experiment{tag}_ber_by_mod.png"))
+    print(f"[EXP] 曲线已保存: experiments/results/experiment{tag}_ber_curves.png / "
           f"experiment{tag}_ber_by_mod.png")
 
 

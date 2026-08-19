@@ -1,9 +1,23 @@
 # -*- coding: utf-8 -*-
-"""夜间训练版性能分析：从 eval_results.json 计算关键指标（只读，不改动产物）"""
-import json, statistics as st
+"""性能分析：从实验/评估结果 JSON 计算关键指标（只读，不改动产物）。
+用法: python -m src.evaluation.analyze [--results experiments/results/eval_results.json]"""
+import argparse
+import json
+import os
+import statistics as st
+import sys
 from collections import defaultdict
 
-with open("eval_results.json") as f:
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from src.utils import config
+
+p = argparse.ArgumentParser()
+p.add_argument("--results", default=config.EVAL_RESULTS,
+               help="评估结果 JSON（默认 config.EVAL_RESULTS）")
+_args = p.parse_args()
+with open(_args.results) as f:
     data = json.load(f)
 R = data["results"]
 N = len(R)

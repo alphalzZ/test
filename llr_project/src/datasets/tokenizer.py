@@ -7,9 +7,16 @@ Tokenizer：信道矩阵 -> 子载波对齐 patch 序列
 - 序列 = [CLS] + patches，长度 = n_sc + 1（自适应，≤121 ≤ LWM MAX_LEN=129）
 - 多配置自适应：1~10 RB（12~120 子载波）直接编码，无需 padding
 """
+import os
+import sys
+
 import numpy as np
 
-import config
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from src.utils import config
 
 ELEMENT_LENGTH = 16
 CLS_TOKEN = 0.2 * np.ones((ELEMENT_LENGTH,), dtype=np.float32)
@@ -32,17 +39,21 @@ def tokenize_3d_var(H):
     H: (N_ant, N_sc, N_symb) complex（N_ant<=8, N_sc<=120, N_symb<=14）
     -> (n_symb, n_sc+1, 16) float32，序列 = [CLS] + 逐子载波 patch
     （不补零到 128，长度 n_sc+1 <= 121 <= LWM MAX_LEN=129，适配任意 RB 数）
+
+    语义与模型内 GPU 版 LWMLLR._tokenize_3d 一致：逐 OFDM 符号 tokenize，
+    每子载波一个 patch = [Re(H[:,k]); Im(H[:,k])]（天线不足 8 补零到 16 维）。
     """
     H = np.asarray(H)
     n_ant, n_sc, n_symb = H.shape
-    real = H.real.T                        # (n_sc, n_ant)
-    imag = H.imag.T
-    patches = np.concatenate([real, imag], axis=1).astype(np.float32)  # (n_sc, 2*n_ant)
+    # (n_symb, n_sc, n_ant)：与 LWMLLR._tokenize_3d 的 (S, n_sc, 8) 布局一致
+    real = H.real.transpose(2, 1, 0)
+    imag = H.imag.transpose(2, 1, 0)
+    patches = np.concatenate([real, imag], axis=2).astype(np.float32)  # (n_symb, n_sc, 2*n_ant)
     if n_ant < 8:                          # 天线补零到 8（16 维 patch，复用官方 embedding）
-        pad = np.zeros((n_sc, 16 - 2 * n_ant), dtype=np.float32)
-        patches = np.concatenate([patches, pad], axis=1)
-    seq = np.concatenate([CLS_TOKEN[None, :], patches], axis=0)     # (n_sc+1, 16)
-    return np.stack([seq] * n_symb)                  # (n_symb, n_sc+1, 16)
+        pad = np.zeros((n_symb, n_sc, 16 - 2 * n_ant), dtype=np.float32)
+        patches = np.concatenate([patches, pad], axis=2)
+    cls = np.broadcast_to(CLS_TOKEN[None, None, :], (n_symb, 1, 16)).copy()
+    return np.concatenate([cls, patches], axis=1)          # (n_symb, n_sc+1, 16)
 
 
 if __name__ == "__main__":

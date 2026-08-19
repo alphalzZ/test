@@ -1,0 +1,14 @@
+{
+  "SYS_FFT": 1024,
+  "SYS_SCS_HZ": 15000.0,
+  "SYS_CP": 72,
+  "MAX_LLR": 20.0,
+  "CARRIER_FREQUENCY": 3500000000.0,
+  "RX_ANTS": [1, 2, 4, 8],
+  "RB_RANGE": [1, 10],
+  "SYMB_RANGE": [3, 14],
+  "DMRS_APS": [0, 1, 2],
+  "TDL_MODELS": ["A", "B", "C", "D"],
+  "DELAY_SPREADS": [3.0e-08, 1.0e-07, 3.0e-07],
+  "MAX_SPEEDS": [0.0, 5.0, 30.0]
+}

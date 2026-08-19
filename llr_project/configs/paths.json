@@ -1,0 +1,16 @@
+{
+  "DATA_DIR_REL": "data",
+  "CKPT_DIR_REL": "experiments/checkpoints",
+  "RESULTS_DIR_REL": "experiments/results",
+  "LOGS_DIR_REL": "experiments/logs",
+  "LWM_REPO_DIR_REL": "../LWM",
+  "LWM_CKPT_FILENAME": "model_weights.pth",
+  "CKPT_PRETRAIN_FILE": "lwm_continued.pt",
+  "CKPT_LLR_FILE": "lwm_llr.pt",
+  "CKPT_LLR_NO_PT_FILE": "lwm_llr_no_pretrain.pt",
+  "CACHE_PT_FILE": "pusch_pt.pkl",
+  "CACHE_TRAIN_FILE": "pusch_train.pkl",
+  "CACHE_VAL_FILE": "pusch_val.pkl",
+  "EVAL_RESULTS_FILE": "eval_results.json",
+  "EVAL_CURVES_FILE": "eval_ber_curves.png"
+}
