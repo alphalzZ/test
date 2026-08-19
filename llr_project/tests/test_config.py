@@ -24,7 +24,7 @@ class TestConfig(unittest.TestCase):
     def test_model_defaults(self):
         self.assertEqual(config.MOD_ORDERS, [4, 16, 64, 256])
         self.assertEqual(config.MAX_BITS, 8)
-        self.assertEqual(config.CFG_DIM, 14)
+        self.assertEqual(config.CFG_DIM, 9)            # 接收端可感知参数（无 TDL/速度）
         self.assertEqual(config.SHALLOW_LAYERS, [3, 4, 5, 6])
 
     def test_training_defaults(self):

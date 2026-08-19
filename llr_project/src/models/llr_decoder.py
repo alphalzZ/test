@@ -20,7 +20,8 @@ from src.utils import config
 # (符号 × 子载波) 全网格上预测逐比特 LLR logits，降低推理复杂度。
 
 # 特征通道数：64(emb)+16(H patch)+2(Re/Im z)+1(σ²)+4(mod_oh)=87
-# + 配置元数据 CFG_DIM=14 + LWM 浅层特征 len(SHALLOW_LAYERS)*64，
+# + 配置元数据 CFG_DIM=9（接收端可感知：n_rx/n_sc/n_symb/dmrs，无信道模型信息）
+#   + LWM 浅层特征 len(SHALLOW_LAYERS)*64，
 # 补零到偶数满足 GroupNorm(groups=2)
 SHALLOW_FEAT_DIM = len(config.SHALLOW_LAYERS) * 64
 FEAT_CH = 87 + config.CFG_DIM + SHALLOW_FEAT_DIM + (

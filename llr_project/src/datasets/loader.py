@@ -24,18 +24,17 @@ from src.utils import config
 
 
 def build_cfg_vec(batch):
-    """配置元数据向量 (B, CFG_DIM)：接收机已知的系统参数（帮助小数据下区分配置）"""
+    """配置元数据向量 (B, CFG_DIM)：**接收端可感知**的系统参数。
+    不含信道模型信息（TDL/多普勒）——接收端不知道信道模型，只含：
+    n_rx onehot(4) + n_sc/120 + n_symb/14 + dmrs_ap onehot(3)。"""
     n = len(batch)
     v = np.zeros((n, config.CFG_DIM), dtype=np.float32)
     ants = [1, 2, 4, 8]
-    tdls = ["A", "B", "C", "D"]
     for i, s in enumerate(batch):
         v[i, 0:4] = [int(s["n_rx"]) == a for a in ants]
         v[i, 4] = int(s["n_sc"]) / 120.0
         v[i, 5] = int(s["n_symb"]) / 14.0
         v[i, 6:9] = [int(s["dmrs_ap"]) == a for a in [0, 1, 2]]
-        v[i, 9:13] = [str(s["tdl"]) == t for t in tdls]
-        v[i, 13] = float(s["max_speed"]) / 30.0
     return v
 
 

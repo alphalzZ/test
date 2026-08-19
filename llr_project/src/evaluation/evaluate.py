@@ -53,16 +53,15 @@ def pearson_corr(a, b):
 
 
 def sample_cfg_vec(s):
-    """单样本 -> 配置元数据向量 (CFG_DIM,)（与 dataset.build_cfg_vec 一致）"""
+    """单样本 -> 配置元数据向量 (CFG_DIM,)（与 loader.build_cfg_vec 一致）。
+    只含接收端可感知参数：n_rx onehot(4) + n_sc/120 + n_symb/14 + dmrs_ap onehot(3)，
+    不含信道模型信息（TDL/多普勒，接收端不感知）。"""
     v = np.zeros(config.CFG_DIM, dtype=np.float32)
     ants = [1, 2, 4, 8]
-    tdls = ["A", "B", "C", "D"]
     v[0:4] = [int(s["n_rx"]) == a for a in ants]
     v[4] = int(s["n_sc"]) / 120.0
     v[5] = int(s["n_symb"]) / 14.0
     v[6:9] = [int(s["dmrs_ap"]) == a for a in [0, 1, 2]]
-    v[9:13] = [str(s["tdl"]) == t for t in tdls]
-    v[13] = float(s["max_speed"]) / 30.0
     return v
 
 
@@ -78,7 +77,12 @@ def eval_sample(sample, model=None, model_nopt=None):
 
     X, btab = qam_constellation(mod_order)
     k = btab.shape[1]
-    llr_base = demap_llr(sample["z"], sample["sigma2_eq"], X, btab, config.MAX_LLR)
+    # 基线 = Sionna 标准 LS+MMSE+APP demapper（generate_batch 的 llr_base）；
+    # 旧缓存（无 llr_base 字段）回退手写 max-log
+    if "llr_base" in sample:
+        llr_base = np.asarray(sample["llr_base"], dtype=np.float32)
+    else:
+        llr_base = demap_llr(sample["z"], sample["sigma2_eq"], X, btab, config.MAX_LLR)
 
     out = {"snr_db": -10 * np.log10(sigma2), "mod": mod_order, "k": k,
            "n_rx": int(sample["n_rx"]), "n_sc": int(sample["n_sc"]),

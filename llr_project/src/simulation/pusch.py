@@ -27,7 +27,10 @@ _sionna_cfg.device = "cpu"
 
 from sionna.phy.nr import (CarrierConfig, PUSCHDMRSConfig, PUSCHConfig,
                            PUSCHTransmitter, PUSCHLSChannelEstimator)
-from sionna.phy.ofdm import OFDMModulator, OFDMDemodulator, ResourceGrid
+from sionna.phy.ofdm import (OFDMModulator, OFDMDemodulator, ResourceGrid,
+                             LMMSEEqualizer)
+from sionna.phy.mimo import StreamManagement
+from sionna.phy.mapping import Demapper, Constellation
 from sionna.phy.channel.tr38901 import TDL
 from sionna.phy.channel import TimeChannel, time_to_ofdm_channel
 
@@ -131,6 +134,17 @@ class SionnaPUSCHSystem:
         self.data_symb = self.data_re_idx[:, 1]         # symb 索引
         self.dmrs_symbs = sorted(set(np.argwhere(pm > 0)[:, 0]))
 
+        # ---- Sionna 标准接收机组件（基线：LS + MMSE + APP demapper） ----
+        # LMMSEEqualizer 输出数据 RE 按 RG pilot 掩码顺序（symb-major），
+        # 与 data_re_idx（sc-major）行序不同，预计算重排索引对齐。
+        sy_sc = np.argwhere(data_mask > 0)              # (n_data,2) = [symb, sc]
+        _order = {tuple(r): i for i, r in enumerate(sy_sc[:, ::-1])}
+        self._sionna_data_perm = np.array(
+            [_order[tuple(r)] for r in self.data_re_idx], dtype=np.int64)
+        self._stream_manager = StreamManagement(np.array([[1]]), 1)
+        self._lmmse = LMMSEEqualizer(self.rg, self._stream_manager, device=device)
+        self._demapper = None                           # 按调制阶数懒创建
+
     def _channel_lags(self):
         """
         计算适配 OFDM 的信道时延参数 (tdl, l_min, l_max)。
@@ -224,28 +238,34 @@ class SionnaPUSCHSystem:
         h_freq = h_freq[:, 0, :, 0, 0, :, self.k0:self.k0 + self.fft_size]  # (B,n_rx,S,fft_bwp)
         H_true = h_freq.permute(0, 1, 3, 2)    # (B,n_rx,sc,symb)
 
-        # ---- 数据 RE 提取 ----
+        # ---- 数据 RE 提取（llr_ref 用真实信道；y_re 供理想 LLR 计算） ----
         B = batch_size
+        no_t = no.to(torch.float32)
         y_re = y[:, 0, :, self.data_symb, self.data_sc]        # (B,n_rx,n_data)
         y_re = y_re.permute(0, 2, 1)                           # (B,n_data,n_rx)
-        H_est_re = H_est[:, :, self.data_sc, self.data_symb]   # (B,n_rx,n_data)
-        H_est_re = H_est_re.permute(0, 2, 1)                   # (B,n_data,n_rx)
         H_true_re = H_true[:, :, self.data_sc, self.data_symb]
         H_true_re = H_true_re.permute(0, 2, 1)
 
-        # ---- MMSE 均衡（批量 n_rx x 1） ----
-        z = torch.zeros(B, self.n_data, dtype=torch.complex64)
-        sig2_eq = torch.zeros(B, self.n_data, dtype=torch.float32)
-        h_c = H_est_re.to(torch.complex64)
-        y_c = y_re.to(torch.complex64)
-        no_t = no.to(torch.float32)
-        eye = torch.eye(self.num_rx_ant, dtype=torch.complex64)
-        for bb in range(B):
-            Hm = h_c[bb].unsqueeze(-1)                        # (n_data,n_rx,1)
-            Hh = Hm @ Hm.conj().transpose(-1, -2)             # (n_data,n_rx,n_rx)
-            w = torch.linalg.solve(Hh + no_t * eye, Hm)       # (n_data,n_rx,1)
-            z[bb] = (w.conj().transpose(-1, -2) @ y_c[bb].unsqueeze(-1))[:, 0, 0]
-            sig2_eq[bb] = no_t * (w.conj() * w).sum(dim=-2)[:, 0].real
+        # ---- Sionna 标准 MMSE 均衡（LMMSEEqualizer，含 LS 估计误差 err_var） ----
+        # 参考 Sionna Neural Receiver 教程：LMMSEEqualizer(resource_grid, stream_management)
+        x_hat, no_eff = self._lmmse(y, h_ls, err_var, no)      # (B,1,1,n_data) / (B,1,1,n_data)
+        p = torch.as_tensor(self._sionna_data_perm, device=self.device)
+        z = x_hat[:, 0, 0][:, p]                               # (B,n_data) sc-major
+        sig2_eq = no_eff[:, 0, 0][:, p]                        # (B,n_data)
+
+        # ---- Sionna 标准 Demapper（maxlog，基线 = LS+MMSE+maxlog） ----
+        # ★ 用自定义星座（本项目的 QAM 点/比特约定，与 bits_tx/llr_ref 一致）：
+        # Sionna 默认 "qam" 星座的点顺序/bit 标签与本项目不同，直接使用会导致
+        # LLR 与发送比特错位（16QAM 中间位随机）；custom 星座完全对齐。
+        if self._demapper is None or self._demapper_k != k:
+            _const = Constellation("custom", k,
+                                   points=torch.tensor(X, dtype=torch.complex64))
+            self._demapper = Demapper("maxlog", constellation=_const,
+                                      device=self.device)
+            self._demapper_k = k
+        llr_base = self._demapper(x_hat, no_eff)               # (B,1,1,n_data*k)
+        llr_base = llr_base[:, 0, 0].reshape(B, self.n_data, k)  # (B,n_data,k)
+        llr_base = llr_base[:, p]                              # 重排到 sc-major
 
         # ---- 参考 LLR（理想信道 max-log，数据 RE） ----
         llr = torch.zeros(B, self.n_data, k, dtype=torch.float32)
@@ -278,6 +298,7 @@ class SionnaPUSCHSystem:
             "sigma2": float(no_t.item()),
             "sigma2_eq": sig2_eq.cpu().numpy().astype(np.float32),
             "llr_ref": llr.cpu().numpy().astype(np.float32),
+            "llr_base": llr_base.cpu().numpy().astype(np.float32),  # Sionna 标准基线 LLR
             "bits_tx": bits.cpu().numpy().astype(np.int8),
             "mod_order": np.int32(mod_order),
             "n_sc": np.int32(self.num_sc),

@@ -125,11 +125,16 @@ class E2ESystem:
         if self.system == "baseline-perfect-csi":
             llr = np.asarray(batch["llr_ref"])
         elif self.system == "baseline-ls-estimation":
-            X, btab = qam_constellation(mod_order)
-            llr = np.stack([demap_llr(np.asarray(batch["z"])[bb],
-                                      np.asarray(batch["sigma2_eq"])[bb],
-                                      X, btab, config.MAX_LLR)
-                            for bb in range(B)])
+            # 基线 = Sionna 标准 LS+MMSE+APP demapper（generate_batch 的 llr_base）；
+            # 旧缓存（无 llr_base）回退手写 max-log
+            if "llr_base" in batch:
+                llr = np.asarray(batch["llr_base"], dtype=np.float32)
+            else:
+                X, btab = qam_constellation(mod_order)
+                llr = np.stack([demap_llr(np.asarray(batch["z"])[bb],
+                                          np.asarray(batch["sigma2_eq"])[bb],
+                                          X, btab, config.MAX_LLR)
+                                for bb in range(B)])
         else:
             # LWM+CNN（神经接收机）：输入 LS 信道估计 + 均衡符号 + 噪声功率
             assert self.model is not None, "neural-receiver 需要加载模型权重"

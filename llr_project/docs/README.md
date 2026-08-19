@@ -79,7 +79,7 @@
 | 子载波 n_sc | 12~120（1~10 RB） | tokenizer 序列长度自适应（≤121 ≤ LWM MAX_LEN=129） |
 | OFDM 符号 n_symb | 3~14 | 逐符号编码，特征图行数自适应（3 符号用 mapping type B） |
 | DMRS | {1} / {1+1} / {1+2} | 数据 RE 索引随样本传入（Sionna pilot mask） |
-| 信道场景 | TDL-A/B/C/D × 时延 × 多普勒 | cfg 通道 + 模型从 H 统计中隐式学习 |
+| 信道场景 | TDL-A/B/C/D × 时延 × 多普勒 | 接收端不感知信道模型：cfg 只含接收端可感知参数，信道从 H 统计中隐式学习 |
 | 系统带宽 | 固定 1024-FFT（≈10MHz） | BWP 嵌入系统网格，信道按系统带宽建模 |
 
 **两阶段训练**：
@@ -164,7 +164,7 @@ chmod +x scripts/train_all.sh
 4. **信道建模**（`sionna.phy.channel.tr38901.TDL` + `TimeChannel`）：**TDL-A/B/C/D** × 时延扩展 {30,100,300}ns × **多普勒**（`min_speed/max_speed`，0/58/350Hz @3.5GHz），1/2/4/8 根接收天线
 5. **OFDM 调制/解调**（`OFDMModulator`/`OFDMDemodulator`）：系统网格调制 → 过信道加噪 → 解调 → 提取 BWP
 6. **信道估计**（`PUSCHLSChannelEstimator`）：DMRS 处 LS 估计 + **线性插值** → 输出**完整频域信道估计**
-7. **MMSE 均衡** + **max-log LLR**（数据 RE，理想信道 max-log 作参考 LLR，评估用）
+7. **Sionna 标准接收机（基线）**：`LMMSEEqualizer`（含 LS 估计误差 `err_var` 修正）+ `Demapper`（maxlog，自定义星座对齐本项目比特约定），数据 RE 输出基线 LLR；理想信道 max-log 作参考 LLR（评估上界）
 
 > 技术要点：① 数据 RE 索引取自 `pilot_pattern.mask`（按实际分配符号数，短 PUSCH 下 `pusch.dmrs_mask` 是 14 符号全帧掩码不匹配）；② `TimeChannel` 显式指定 `l_min=0/l_max≤CP`（Sionna 默认 ±6 样本裕量在窄带采样率下会超出循环前缀）；③ 3 符号 PUSCH 用 mapping type B（`symbol_allocation=[0,3]`），4~14 符号用 type A。
 > 安装：`pip install sionna`（Sionna 2.0.1 已改为纯 PyTorch 实现，**无需 TensorFlow**，支持 Python 3.11+）。
@@ -367,17 +367,17 @@ patch_k = [Re(H[:,k]); Im(H[:,k])] ∈ R^16   （天线不足 8 时补零，维�
 
 ### 9.2 3D 信道输入（{num_rx, num_sc, num_symb} 自适应）
 
-Sionna PUSCH 链路输出完整频域信道估计 `H_est (n_rx, n_sc, n_symb)`（rx × sc × symb，维度随配置变化）。模型**逐 OFDM 符号独立编码**：每个符号的 (n_rx, n_sc) 信道 → 天线补零到 8 → n_sc patches + CLS → LWM 序列 (n_sc+1, 16)，n_symb 个符号得到 n_symb 组 channel embedding。Decoder 只对**数据 RE**（索引随样本传入，DMRS 符号之外）输出 LLR。接收机已知的系统参数（天线数/RB/符号/DMRS 模式/TDL/速度）作为 **cfg 元数据通道** 输入 Decoder，帮助模型在小数据下区分配置。
+Sionna PUSCH 链路输出完整频域信道估计 `H_est (n_rx, n_sc, n_symb)`（rx × sc × symb，维度随配置变化）。模型**逐 OFDM 符号独立编码**：每个符号的 (n_rx, n_sc) 信道 → 天线补零到 8 → n_sc patches + CLS → LWM 序列 (n_sc+1, 16)，n_symb 个符号得到 n_symb 组 channel embedding。Decoder 只对**数据 RE**（索引随样本传入，DMRS 符号之外）输出 LLR。**接收端可感知**的系统参数（天线数/RB/符号数/DMRS 模式）作为 **cfg 元数据通道**（9 维）输入 Decoder；**信道模型信息（TDL/多普勒）接收端不可感知，不入 cfg**，模型从 H 统计中隐式学习。
 
 ### 9.3 CNN 残差 Decoder（关键设计）
 
 参考 **NNreceiver** 架构（CNN 残差网络），直接在 (符号 × 子载波) 全网格上预测 LLR：
 
-- **特征图输入**：`[channel_emb(64) + LWM 浅层特征(3~6层, 256) + H_est_patch(16) + Re(z) + Im(z) + σ² + mod_onehot(4) + 配置元数据 cfg(14)]` = 357 通道（补零到 358 满足 GroupNorm(groups=2)），布局 (B, 358, n_symb, n_sc)；浅层特征提供更细粒度的局部信道模式，与深层全局上下文互补
+- **特征图输入**：`[channel_emb(64) + LWM 浅层特征(3~6层, 256) + H_est_patch(16) + Re(z) + Im(z) + σ² + mod_onehot(4) + 配置元数据 cfg(9)]` = 352 通道（偶数，满足 GroupNorm(groups=2)），布局 (B, 352, n_symb, n_sc)；浅层特征提供更细粒度的局部信道模式，与深层全局上下文互补
 - **网络结构**：GroupNorm(2) → 3×3 转置卷积（64 通道）→ **11 个残差块**（GroupNorm + 空洞可分离卷积 3×3，out_channels `[64,64,128,128,256,256,256,128,128,64,64]`，dilation `[(1,1),(1,1),(2,3),(2,3),(2,3),(3,6),(2,3),(2,3),(2,3),(1,1),(1,1)]`）→ 3×3 卷积 → 8 通道 logits（全卷积，**对网格尺寸自适应**）
 - **输出**：全网格 logits → 按样本 `data_re_idx` 取数据 RE → `(B, n_data, 8)`，裁剪 ±MAX_LLR
 - z 仅数据 RE 位置有值（其余为 0），空洞卷积利用**邻近 RE 的空间/频率上下文**弥补缺失信息
-- **配置元数据通道**（cfg）：天线数/RB 数/符号数/DMRS 模式/TDL/速度，接收机已知的系统参数，帮助模型在有限数据下区分配置（小数据预实验证明其必要性）
+- **配置元数据通道**（cfg，9 维）：天线数 onehot(4) + n_sc/120 + n_symb/14 + DMRS 模式 onehot(3) —— 均为**接收端可感知**参数；**不含信道模型信息**（TDL/多普勒，接收端无法感知），信道特征由模型从 H 估计中隐式学习（小数据预实验证明 cfg 通道的必要性）
 
 **为什么不用 llr_base 残差学习**：llr_base 需要完整传统软解调（复杂且本身就是近似解）。本方案直接预测后验 LLR logits，推理更简洁，且配合 BCE 训练硬判决 BER 显著优于基线；CNN 的空间上下文能力替代了"基线锚点"的作用。
 
