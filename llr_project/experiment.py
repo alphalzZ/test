@@ -57,6 +57,24 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def _setup_cjk_font():
+    """设置 matplotlib 中文字体（按系统可用字体自动选择），修复中文变方块。
+    图例/标题含中文（理想上界/基线/本方案/对照 等），默认 DejaVu Sans 无中文字形。"""
+    from matplotlib import font_manager
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for name in ("Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC",
+                 "Noto Sans CJK HK", "WenQuanYi Zen Hei", "WenQuanYi Micro Hei",
+                 "SimHei", "Microsoft YaHei", "PingFang SC", "Droid Sans Fallback",
+                 "AR PL UMing CN", "AR PL UKai CN"):
+        if name in available:
+            plt.rcParams["font.sans-serif"] = [name, "DejaVu Sans"]
+            break
+    plt.rcParams["axes.unicode_minus"] = False   # 负号用 ASCII 连字符，避免字体缺失
+
+
+_setup_cjk_font()
+
+
 # =============================================================================
 # E2ESystem：端到端系统（教程 "End-to-end System" 架构）
 # =============================================================================
@@ -351,11 +369,23 @@ def plot_ber_curves(results, args, png_total, png_mod):
               "lwm": "LWM+CNN (本方案)", "lwm_nopt": "LWM+CNN (对照)"}
     markers = {"ref": "d--", "base": "o-", "lwm": "s-", "lwm_nopt": "^-"}
 
+    def ber_series(rs, tag):
+        """按 SNR 聚合 BER；某 (SNR, 子集) 无样本时置 None（避免空均值警告）"""
+        ys = []
+        for s in snrs:
+            vals = [r[f"ber_{tag}"] for r in rs if abs(r["snr_db"] - s) < 1e-6]
+            ys.append(float(np.mean(vals)) if vals else None)
+        return ys
+
+    def plot_line(ax, ys, marker, label):
+        xs = [s for s, y in zip(snrs, ys) if y is not None]
+        ok = [y for y in ys if y is not None]
+        if ok:
+            ax.semilogy(xs, ok, marker, label=label)
+
     fig, ax = plt.subplots(figsize=(7, 5))
     for t in tags:
-        ys = [float(np.mean([r[f"ber_{t}"] for r in results
-                             if abs(r["snr_db"] - s) < 1e-6])) for s in snrs]
-        ax.semilogy(snrs, ys, markers[t], label=labels[t])
+        plot_line(ax, ber_series(results, t), markers[t], labels[t])
     ax.set_xlabel("SNR (dB)")
     ax.set_ylabel("BER")
     ax.set_title("BER vs SNR (多配置混合)" + (f"  [{args.tag}]" if args.tag else ""))
@@ -371,9 +401,7 @@ def plot_ber_curves(results, args, png_total, png_mod):
     for ax, m in zip(axes[0], mods):
         rs = [r for r in results if r["mod"] == m]
         for t in tags:
-            ys = [float(np.mean([r[f"ber_{t}"] for r in rs if abs(r["snr_db"] - s) < 1e-6]))
-                  if rs else None for s in snrs]
-            ax.semilogy(snrs, ys, markers[t], label=labels[t])
+            plot_line(ax, ber_series(rs, t), markers[t], labels[t])
         ax.set_xlabel("SNR (dB)")
         ax.set_ylabel("BER")
         ax.set_title(f"QAM{m}")
