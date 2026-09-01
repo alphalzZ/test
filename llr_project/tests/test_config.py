@@ -55,7 +55,7 @@ class TestConfig(unittest.TestCase):
         out = r.stdout.strip().split()
         self.assertEqual(int(out[0]), int(night["TRAIN_N"]))   # 与 night.json 一致
         self.assertEqual(int(out[1]), int(night["FT_EPOCHS"])) # FT_EPOCHS
-        self.assertEqual(out[2], "False")                      # USE_PRETRAIN
+        self.assertEqual(out[2], "True" if night["USE_PRETRAIN"] else "False")
         self.assertTrue(out[3].endswith("lwm_llr_night.pt"))   # CKPT_LLR
 
 
