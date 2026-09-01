@@ -34,6 +34,8 @@ from sionna.phy.mapping import Demapper, Constellation
 from sionna.phy.channel.tr38901 import TDL
 from sionna.phy.channel import TimeChannel, time_to_ofdm_channel
 
+from src.simulation.legacy_rx import legacy_ofdm_rx_llr
+
 import os
 import sys
 
@@ -127,6 +129,7 @@ class SionnaPUSCHSystem:
         if torch.is_tensor(pm):
             pm = pm.cpu().numpy()
         pm = np.asarray(pm)[0, 0]                       # (num_symb, num_sc)
+        self.pilot_mask = pm                            # 导频掩码（供 legacy 基线等使用）
         data_mask = 1 - pm                              # 数据 RE = 非导频
         self.data_re_idx = np.argwhere(data_mask.T > 0)  # (n_data, 2) = [sc, symb]
         self.n_data = self.data_re_idx.shape[0]
@@ -271,6 +274,20 @@ class SionnaPUSCHSystem:
         llr_base = llr_base[:, 0, 0].reshape(B, self.n_data, k)  # (B,n_data,k)
         llr_base = llr_base[:, p]                              # 重排到 sc-major
 
+        # ---- ofdm_rx 风格传统接收机基线（LS平滑 + 导频残差噪声 + MMSE + APP LLR） ----
+        # 参考 wirelessLearning/src/ofdm_rx.py 的接收处理链，见 legacy_rx.py。
+        x_grid_b = x[:, 0, 0]                                  # (B,S,fft) 发射网格
+        pil_idx = np.argwhere(self.pilot_mask > 0)      # [symb, sc] 导频位置
+        llr_legacy = np.zeros((B, self.n_data, k), dtype=np.float32)
+        y_np = y.cpu().numpy()
+        H_est_np = H_est.cpu().numpy()                         # (B,n_rx,sc,symb)
+        for bb in range(B):
+            x_pil = x_grid_b[bb, pil_idx[:, 0], pil_idx[:, 1]].cpu().numpy()
+            llr_legacy[bb] = legacy_ofdm_rx_llr(
+                y_np[bb, 0],                                   # (n_rx, S, fft)
+                H_est_np[bb].transpose(0, 2, 1),               # (n_rx, S, fft)
+                self.pilot_mask, x_pil, self.data_re_idx, mod_order)
+
         # ---- 参考 LLR（理想信道 max-log，数据 RE） ----
         llr = torch.zeros(B, self.n_data, k, dtype=torch.float32)
         bits = torch.zeros(B, self.n_data, k, dtype=torch.int8)
@@ -303,6 +320,7 @@ class SionnaPUSCHSystem:
             "sigma2_eq": sig2_eq.cpu().numpy().astype(np.float32),
             "llr_ref": llr.cpu().numpy().astype(np.float32),
             "llr_base": llr_base.cpu().numpy().astype(np.float32),  # Sionna 标准基线 LLR
+            "llr_legacy": llr_legacy.astype(np.float32),           # ofdm_rx 风格传统基线 LLR
             "bits_tx": bits.cpu().numpy().astype(np.int8),
             "mod_order": np.int32(mod_order),
             "n_sc": np.int32(self.num_sc),

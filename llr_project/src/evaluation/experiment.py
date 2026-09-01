@@ -102,6 +102,7 @@ class E2ESystem:
 
     def __init__(self, system, cfg, model=None):
         assert system in ("baseline-perfect-csi", "baseline-ls-estimation",
+                          "baseline-legacy-rx",
                           "neural-receiver", "neural-receiver-nopt"), system
         self.system = system
         self.cfg = dict(cfg) if cfg else None
@@ -125,10 +126,21 @@ class E2ESystem:
         if self.system == "baseline-perfect-csi":
             llr = np.asarray(batch["llr_ref"])
         elif self.system == "baseline-ls-estimation":
-            # 基线 = Sionna 标准 LS+MMSE+APP demapper（generate_batch 的 llr_base）；
+            # 基线 = Sionna 标准 LS+MMSE+maxlog（generate_batch 的 llr_base）；
             # 旧缓存（无 llr_base）回退手写 max-log
             if "llr_base" in batch:
                 llr = np.asarray(batch["llr_base"], dtype=np.float32)
+            else:
+                X, btab = qam_constellation(mod_order)
+                llr = np.stack([demap_llr(np.asarray(batch["z"])[bb],
+                                          np.asarray(batch["sigma2_eq"])[bb],
+                                          X, btab, config.MAX_LLR)
+                                for bb in range(B)])
+        elif self.system == "baseline-legacy-rx":
+            # 基线 = ofdm_rx 风格传统接收机（LS平滑+导频残差噪声+MMSE+APP LLR），
+            # 见 src/simulation/legacy_rx.py；旧缓存（无 llr_legacy）回退手写 max-log
+            if "llr_legacy" in batch:
+                llr = np.asarray(batch["llr_legacy"], dtype=np.float32)
             else:
                 X, btab = qam_constellation(mod_order)
                 llr = np.stack([demap_llr(np.asarray(batch["z"])[bb],
@@ -203,7 +215,8 @@ def run_experiment(args):
     # 内部 tag 与结果键一致（ber_ref/ber_base/ber_lwm/ber_lwm_nopt，
     # 兼容 evaluate.py 与 analyze_night.py），显示名在 print/plot 中映射。
     receivers = [("ref", E2ESystem("baseline-perfect-csi", None)),
-                 ("base", E2ESystem("baseline-ls-estimation", None))]
+                 ("base", E2ESystem("baseline-ls-estimation", None)),
+                 ("legacy", E2ESystem("baseline-legacy-rx", None))]
     if model is not None:
         print(f"[EXP] 主模型: {args.ckpt}")
         receivers.append(("lwm", E2ESystem("neural-receiver", None, model)))
@@ -276,40 +289,40 @@ def summarize(results, args):
             return None
         return float(np.mean([r[key] for r in rs]))
 
+    TAGS = ("ref", "base", "legacy", "lwm", "lwm_nopt")
     out = {"by_snr": [], "by_mod": [], "by_ant": [], "by_rb": [],
            "by_symb": [], "by_dmrs": [], "by_tdl": [], "by_speed": []}
     for snr in sorted({r["snr_db"] for r in results}):
-        out["by_snr"].append({"snr": snr, "n": sum(1 for r in results if r["snr_db"] == snr),
-                              "ber_base": agg("ber_base", lambda r, s=snr: r["snr_db"] == s),
-                              "ber_lwm": agg("ber_lwm", lambda r, s=snr: r["snr_db"] == s),
-                              "ber_lwm_nopt": agg("ber_lwm_nopt", lambda r, s=snr: r["snr_db"] == s),
-                              "ber_ref": agg("ber_ref", lambda r, s=snr: r["snr_db"] == s)})
+        row = {"snr": snr, "n": sum(1 for r in results if r["snr_db"] == snr)}
+        for t in TAGS:
+            row[f"ber_{t}"] = agg(f"ber_{t}", lambda r, s=snr: r["snr_db"] == s)
+        out["by_snr"].append(row)
     for mod in sorted({r["mod"] for r in results}):
-        out["by_mod"].append({"mod": mod, "n": sum(1 for r in results if r["mod"] == mod),
-                              "ber_base": agg("ber_base", lambda r, m=mod: r["mod"] == m),
-                              "ber_lwm": agg("ber_lwm", lambda r, m=mod: r["mod"] == m),
-                              "ber_lwm_nopt": agg("ber_lwm_nopt", lambda r, m=mod: r["mod"] == m),
-                              "ber_ref": agg("ber_ref", lambda r, m=mod: r["mod"] == m)})
+        row = {"mod": mod, "n": sum(1 for r in results if r["mod"] == mod)}
+        for t in TAGS:
+            row[f"ber_{t}"] = agg(f"ber_{t}", lambda r, m=mod: r["mod"] == m)
+        out["by_mod"].append(row)
     for key, outkey in [("n_rx", "by_ant"), ("n_sc", "by_rb"), ("n_symb", "by_symb"),
                         ("dmrs_ap", "by_dmrs"), ("tdl", "by_tdl"), ("max_speed", "by_speed")]:
         for v in sorted({r[key] for r in results}):
             entry = {"value": v, "n": sum(1 for r in results if r[key] == v)}
-            for tag in ("ref", "base", "lwm", "lwm_nopt"):
-                entry[f"ber_{tag}"] = agg(f"ber_{tag}",
-                                          lambda r, k=key, v=v: r[k] == v)
+            for t in TAGS:
+                entry[f"ber_{t}"] = agg(f"ber_{t}",
+                                        lambda r, k=key, v=v: r[k] == v)
             out[outkey].append(entry)
     out["llr"] = {k: agg(k) for k in
                   ("mse_base", "corr_base", "mse_lwm", "corr_lwm",
                    "mse_lwm_nopt", "corr_lwm_nopt")}
     # BMD rate（教程训练目标 R=1-BCE/ln2，全样本平均）
     out["bmd"] = {}
-    for tag in ("ref", "base", "lwm", "lwm_nopt"):
+    for tag in ("ref", "base", "lwm", "lwm_nopt", "legacy"):
         if f"bmd_{tag}" in results[0]:
             out["bmd"][tag] = float(np.mean([r[f"bmd_{tag}"] for r in results]))
     return out
 
 
-DISPLAY = {"ref": "ref", "base": "base", "lwm": "lwm", "lwm_nopt": "lwm_noPT"}
+DISPLAY = {"ref": "ref", "base": "base", "lwm": "lwm", "lwm_nopt": "lwm_noPT",
+           "legacy": "legacy"}
 
 
 def print_summary(s, receivers):
@@ -317,7 +330,8 @@ def print_summary(s, receivers):
     def fmt_val(v):
         return "    -" if v is None else f"{v:8.4f}"
 
-    names = {t: {"ref": "ref", "base": "base", "lwm": "lwm", "lwm_nopt": "lwm_noPT"}[t]
+    names = {t: {"ref": "ref", "base": "base", "lwm": "lwm", "lwm_nopt": "lwm_noPT",
+                 "legacy": "legacy"}[t]
              for t, _ in receivers}
     has = {t: f"ber_{t}" in s["by_snr"][0] for t, _ in receivers}
 
@@ -363,7 +377,7 @@ def print_summary(s, receivers):
             print(f"  {t:>9}: MSE={m:.4f}  corr={s['llr'][f'corr_{t}']:.4f}")
 
     print("\nBMD rate（教程训练目标 R=1-BCE/ln2，全样本平均，越高越好）:")
-    for t in ("ref", "base", "lwm", "lwm_nopt"):
+    for t in ("ref", "base", "lwm", "lwm_nopt", "legacy"):
         v = s["bmd"].get(t)
         if v is not None:
             print(f"  {DISPLAY[t]:>9}: {v:.4f} bit")
@@ -372,10 +386,13 @@ def print_summary(s, receivers):
 def plot_ber_curves(results, args, png_total, png_mod):
     """BER vs SNR 曲线（教程 Fig 风格：semilogy，每接收机一条线）"""
     snrs = sorted({r["snr_db"] for r in results})
-    tags = [t for t in ("ref", "base", "lwm", "lwm_nopt") if f"ber_{t}" in results[0]]
+    tags = [t for t in ("ref", "base", "lwm", "lwm_nopt", "legacy")
+            if f"ber_{t}" in results[0]]
     labels = {"ref": "理想上界 (perfect CSI)", "base": "LS+MMSE 基线",
+              "legacy": "ofdm_rx 传统 RX",
               "lwm": "LWM+CNN (本方案)", "lwm_nopt": "LWM+CNN (对照)"}
-    markers = {"ref": "d--", "base": "o-", "lwm": "s-", "lwm_nopt": "^-"}
+    markers = {"ref": "d--", "base": "o-", "lwm": "s-", "lwm_nopt": "^-",
+               "legacy": "x-"}
 
     def ber_series(rs, tag):
         """按 SNR 聚合 BER；某 (SNR, 子集) 无样本时置 None（避免空均值警告）"""

@@ -95,6 +95,13 @@ def eval_sample(sample, model=None, model_nopt=None):
     hard = (llr_base > 0).astype(int)
     out["ber_base"] = float(np.mean(hard != bits))
 
+    # ofdm_rx 风格传统接收机基线（generate_batch 的 llr_legacy，仅新数据）
+    if "llr_legacy" in sample:
+        llr_leg = np.asarray(sample["llr_legacy"], dtype=np.float32)
+        out["mse_legacy"] = float(np.mean((llr_leg - llr_ref) ** 2))
+        out["corr_legacy"] = pearson_corr(llr_leg, llr_ref)
+        out["ber_legacy"] = float(np.mean(((llr_leg > 0).astype(int)) != bits))
+
     if model is not None:
         llr_lwm = model.infer_llr(H_est, sample["z"], sigma2, mod_order, dri, cfg)
         out["mse_lwm"] = float(np.mean((llr_lwm - llr_ref) ** 2))
